@@ -155,12 +155,20 @@ class PipelineLastLayer(CustomMlxLayer):
         self.is_prefill: bool = False
         self.queue_sends: bool = False
 
-    def __call__(self, x: mx.array, *args: object, **kwargs: object) -> mx.array:
+    def __call__(self, x: mx.array, *args: object, **kwargs: object) -> object:
         cache = self.original_layer_signature.bind_partial(
             x, *args, **kwargs
         ).arguments.get("cache", None)
 
-        output: mx.array = self.original_layer(x, *args, **kwargs)
+        result = self.original_layer(x, *args, **kwargs)
+        # Some mlx-lm layers (e.g. GLM MoE DSA's cross-layer indexer sharing)
+        # return (hidden_states, *extras) rather than a bare array. The pipeline
+        # send/all_gather act on the hidden state; the extras pass through so the
+        # model's `h, prev = layer(...)` unpacking still holds at a shard boundary.
+        if isinstance(result, tuple):
+            output, extras = result[0], result[1:]
+        else:
+            output, extras = result, ()
 
         # Eval layer output to materialize it before send — this splits the graph
         # so the send is isolated and the receiving rank's recv can complete.
@@ -191,6 +199,8 @@ class PipelineLastLayer(CustomMlxLayer):
             ]
             mx.eval(output)
 
+        if extras:
+            return (output, *extras)
         return output
 
 
