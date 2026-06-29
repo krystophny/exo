@@ -94,7 +94,27 @@ class TestParseToolCalls:
 
         assert len(results) == 1
         assert isinstance(results[0], GenerationResponse)
-        assert results[0].finish_reason == "error"
+        assert results[0].finish_reason == "stop"
+
+    def test_malformed_tool_call_schema_stops_without_error(self):
+        text = (
+            "<tool_call>bash"
+            "<arg_key>command</arg_key>"
+            "<arg_value>cat /tmp/log | tail -40</arg_value>"
+            "<arg_key>description concatenated command</arg_value>"
+        )
+        results = list(
+            parse_tool_calls(
+                _make_responses([text]),
+                _dummy_parser,
+                tools=None,
+            )
+        )
+
+        assert len(results) == 1
+        assert isinstance(results[0], GenerationResponse)
+        assert results[0].text == text
+        assert results[0].finish_reason == "stop"
 
     def test_no_tool_call_passes_through(self):
         """Responses without tool calls should pass through unchanged."""
@@ -118,7 +138,7 @@ class TestParseToolCalls:
         assert r1.finish_reason == "stop"
 
     def test_failed_parse_yields_text(self):
-        """When tool call parsing fails, the text should be yielded as-is."""
+        """When tool call parsing fails, the text should stop normally."""
 
         def _failing_parser(text: str) -> dict[str, Any]:
             raise ValueError("parse failed")
@@ -135,7 +155,7 @@ class TestParseToolCalls:
         assert len(results) == 1
         assert isinstance(results[0], GenerationResponse)
         assert results[0].text == "<tool_call>bad content</tool_call>"
-        assert results[0].finish_reason == "error"
+        assert results[0].finish_reason == "stop"
 
     def test_tool_schema_coerces_string_arguments_to_expected_types(self):
         """Tool argument values should be coerced using provided JSON schema."""
