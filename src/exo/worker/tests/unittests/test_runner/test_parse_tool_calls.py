@@ -45,6 +45,57 @@ class TestParseToolCalls:
         assert len(results) == 1
         assert isinstance(results[0], ToolCallResponse)
 
+    def test_split_tool_call_marker_is_buffered(self):
+        texts = ["before ", "<too", "l_call>", "test_fn", "</tool", "_call>"]
+        results = list(
+            parse_tool_calls(
+                _make_responses(texts),
+                _dummy_parser,
+                tools=None,
+            )
+        )
+
+        assert len(results) == 2
+        assert isinstance(results[0], GenerationResponse)
+        assert results[0].text == "before "
+        assert isinstance(results[1], ToolCallResponse)
+
+    def test_tool_call_after_text_in_same_chunk_is_parsed(self):
+        texts = ["before <tool_call>test_fn</tool_call>"]
+        results = list(
+            parse_tool_calls(
+                _make_responses(texts),
+                _dummy_parser,
+                tools=None,
+            )
+        )
+
+        assert len(results) == 2
+        assert isinstance(results[0], GenerationResponse)
+        assert results[0].text == "before "
+        assert isinstance(results[1], ToolCallResponse)
+
+    def test_nested_control_markup_in_tool_argument_fails_closed(self):
+        def _nested_parser(_text: str) -> dict[str, Any]:
+            return {
+                "name": "bash",
+                "arguments": {
+                    "command": "python3 -c '</think><tool_call>bash'",
+                },
+            }
+
+        results = list(
+            parse_tool_calls(
+                _make_responses(["<tool_call>", "bash", "</tool_call>"]),
+                make_mlx_parser("<tool_call>", "</tool_call>", _nested_parser),
+                tools=None,
+            )
+        )
+
+        assert len(results) == 1
+        assert isinstance(results[0], GenerationResponse)
+        assert results[0].finish_reason == "error"
+
     def test_no_tool_call_passes_through(self):
         """Responses without tool calls should pass through unchanged."""
         texts = ["Hello", " world"]

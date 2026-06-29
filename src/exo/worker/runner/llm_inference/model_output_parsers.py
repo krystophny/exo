@@ -419,74 +419,139 @@ def parse_tool_calls(
     tools: list[dict[str, Any]] | None,
 ) -> Generator[GenerationResponse | ToolCallResponse | None]:
     in_tool_call = False
-    tool_call_text_parts: list[str] = []
-    accumulated_tool_calls: list[ToolCallItem] = []
+    pending_buffer: list[GenerationResponse] = []
+    accumulated = ""
+    tool_call_text = ""
+
+    def _try_parse_tool_call(
+        text: str, response: GenerationResponse
+    ) -> ToolCallResponse | GenerationResponse:
+        parsed = tool_parser.parse(text.strip(), tools=tools)
+        logger.info(f"parsed tool call text into {parsed=}")
+        if parsed is None or _tool_call_contains_control_markup(parsed):
+            logger.warning(f"tool call parsing failed for text {text}")
+            return response.model_copy(
+                update={"text": text, "token": 0, "finish_reason": "error"}
+            )
+        return ToolCallResponse(
+            tool_calls=parsed,
+            usage=response.usage,
+            stats=response.stats,
+        )
 
     for response in responses:
         if response is None:
             yield None
             continue
 
-        if not in_tool_call and response.text.startswith(tool_parser.start_parsing):
-            in_tool_call = True
-
-        if (
-            not in_tool_call
-            and accumulated_tool_calls
-            and (response.stats is not None or response.finish_reason is not None)
-        ):
-            yield ToolCallResponse(
-                tool_calls=accumulated_tool_calls,
-                usage=response.usage,
-                stats=response.stats,
-            )
-            accumulated_tool_calls.clear()
-            continue
-
-        if not in_tool_call:
-            yield response
-            continue
-
-        tool_call_text_parts.append(response.text)
-        if response.text.endswith(tool_parser.end_parsing):
-            # parse the actual tool calls from the tool call text
-            combined = "".join(tool_call_text_parts)
-            parsed = tool_parser.parse(combined.strip(), tools=tools)
-            logger.info(f"parsed {tool_call_text_parts=} into {parsed=}")
-            in_tool_call = False
-            tool_call_text_parts = []
-
-            if parsed is None:
-                logger.warning(f"tool call parsing failed for text {combined}")
+        if in_tool_call:
+            tool_call_text += response.text
+            if tool_parser.end_parsing in tool_call_text:
+                end_index = tool_call_text.index(tool_parser.end_parsing) + len(
+                    tool_parser.end_parsing
+                )
+                tool_block = tool_call_text[:end_index]
+                remainder = tool_call_text[end_index:]
+                parsed_response = _try_parse_tool_call(tool_block, response)
+                yield parsed_response
+                if isinstance(parsed_response, GenerationResponse):
+                    break
+                in_tool_call = False
+                tool_call_text = ""
+                if remainder:
+                    yield response.model_copy(update={"text": remainder})
+                continue
+            if response.finish_reason is not None:
+                logger.info(
+                    "tool call parsing interrupted, yield partial tool call as text"
+                )
                 yield response.model_copy(
-                    update={"text": combined, "token": 0, "finish_reason": "error"}
+                    update={
+                        "text": tool_call_text,
+                        "token": 0,
+                        "finish_reason": "error",
+                    }
                 )
                 break
-
-            accumulated_tool_calls.extend(parsed)
-            if accumulated_tool_calls and (
-                response.finish_reason is not None or response.stats is not None
-            ):
-                yield ToolCallResponse(
-                    tool_calls=accumulated_tool_calls,
-                    usage=response.usage,
-                    stats=response.stats,
-                )
-                accumulated_tool_calls.clear()
             continue
 
         if response.finish_reason is not None:
-            logger.info(
-                "tool call parsing interrupted, yield partial tool call as text"
-            )
-            response = response.model_copy(
-                update={
-                    "text": "".join(tool_call_text_parts),
-                    "token": 0,
-                    "finish_reason": "error",
-                }
-            )
-            yield response
+            accumulated += response.text
+            if tool_parser.start_parsing in accumulated:
+                start_index = accumulated.index(tool_parser.start_parsing)
+                before = accumulated[:start_index]
+                tool_call_text = accumulated[start_index:]
+                if before:
+                    yield response.model_copy(update={"text": before})
+                if tool_parser.end_parsing in tool_call_text:
+                    parsed_response = _try_parse_tool_call(tool_call_text, response)
+                    yield parsed_response
+                    if isinstance(parsed_response, GenerationResponse):
+                        break
+                else:
+                    yield response.model_copy(
+                        update={
+                            "text": tool_call_text,
+                            "token": 0,
+                            "finish_reason": "error",
+                        }
+                    )
+            else:
+                yield from pending_buffer
+                pending_buffer.clear()
+                yield response.model_copy(update={"text": accumulated})
+            break
 
-    if not accumulated_tool_calls:
-        logger.warning("Tool calls should have all been emitted but were not")
+        accumulated += response.text
+
+        if tool_parser.start_parsing in accumulated:
+            start_index = accumulated.index(tool_parser.start_parsing)
+            before = accumulated[:start_index]
+            if before:
+                for buffered in pending_buffer:
+                    if not before:
+                        break
+                    chunk = buffered.text
+                    if len(chunk) <= len(before):
+                        yield buffered
+                        before = before[len(chunk) :]
+                    else:
+                        yield buffered.model_copy(update={"text": before})
+                        before = ""
+            pending_buffer.clear()
+            tool_call_text = accumulated[start_index:]
+            accumulated = ""
+
+            if tool_parser.end_parsing in tool_call_text:
+                parsed_response = _try_parse_tool_call(tool_call_text, response)
+                yield parsed_response
+                if isinstance(parsed_response, GenerationResponse):
+                    break
+                tool_call_text = ""
+            else:
+                in_tool_call = True
+            continue
+
+        if _could_be_marker_prefix(accumulated, tool_parser.start_parsing):
+            pending_buffer.append(response)
+            continue
+
+        yield from pending_buffer
+        pending_buffer.clear()
+        accumulated = ""
+        yield response
+
+    yield from pending_buffer
+
+
+def _tool_call_contains_control_markup(tool_calls: list[ToolCallItem]) -> bool:
+    control_markers = (
+        "<tool_call>",
+        "</tool_call>",
+        "<think>",
+        "</think>",
+    )
+    for tool_call in tool_calls:
+        if any(marker in tool_call.arguments for marker in control_markers):
+            return True
+    return False
