@@ -54,6 +54,26 @@ def take_ready_topk(batch: GenerationBatch) -> BatchTopKLogprobs:
     return _get_buffer(batch).ready
 
 
+def _apply_logits_processors(
+    logits: mx.array,
+    logits_processors: list[list | None] | None,
+    tokens: list[list[int]],
+    uids: list[int],
+) -> mx.array:
+    if logits_processors is None or not any(logits_processors):
+        return logits
+
+    processed_logits: list[mx.array] = []
+    for e in range(len(uids)):
+        sample_logits = logits[e : e + 1]
+        processors = logits_processors[e]
+        if processors is not None:
+            for processor in processors:
+                sample_logits = processor(mx.array(tokens[e]), sample_logits)
+        processed_logits.append(sample_logits)
+    return mx.concatenate(processed_logits, axis=0)
+
+
 def _patched_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
     self._current_tokens = self._next_tokens
     self._current_logprobs = self._next_logprobs
@@ -67,14 +87,12 @@ def _patched_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
     logits = self.model(inputs[:, None], cache=self.prompt_cache)
     logits = logits[:, -1, :]
 
-    if self.logits_processors is not None and any(self.logits_processors):
-        processed_logits: list[mx.array] = []
-        for e in range(len(self.uids)):
-            sample_logits = logits[e : e + 1]
-            for processor in self.logits_processors[e]:
-                sample_logits = processor(mx.array(self.tokens[e]), sample_logits)
-            processed_logits.append(sample_logits)
-        logits = mx.concatenate(processed_logits, axis=0)
+    logits = _apply_logits_processors(
+        logits,
+        self.logits_processors,
+        self.tokens,
+        self.uids,
+    )
 
     logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 

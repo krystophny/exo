@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 import mlx.core as mx
 import pytest
 
+from exo.worker.engines.mlx.patches.opt_batch_gen import _apply_logits_processors
 from exo.worker.engines.mlx.generator.generate import extract_top_logprobs
 
 
@@ -67,3 +68,19 @@ class TestExtractTopLogprobsFallback:
         lp = _make_logprobs([-1.0, -2.0])
         _, items = extract_top_logprobs(lp, tok, top_logprobs=2, selected_token=0)
         assert items[0].bytes == list("hello".encode("utf-8"))
+
+
+def test_apply_logits_processors_skips_none_entries() -> None:
+    logits = mx.array([[1.0, 2.0], [3.0, 4.0]], dtype=mx.float32)
+
+    def add_one(_tokens: mx.array, sample_logits: mx.array) -> mx.array:
+        return sample_logits + 1
+
+    processed = _apply_logits_processors(
+        logits,
+        [None, [add_one]],
+        [[0], [1]],
+        [10, 11],
+    )
+
+    assert processed.tolist() == [[1.0, 2.0], [4.0, 5.0]]
