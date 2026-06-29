@@ -106,7 +106,7 @@ def _patched_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
         sampled = self.fallback_sampler(logprobs)
 
     self._next_tokens = sampled
-    self._next_logprobs = logprobs
+    self._next_logprobs = list(logprobs)
 
     if buf.needs_topk:
         batch_size = len(self.uids)
@@ -125,13 +125,13 @@ def _patched_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
         )
         mx.async_eval(
             self._next_tokens,
-            self._next_logprobs,
+            logprobs,
             pending_indices,
             pending_values,
             pending_selected,
         )
     else:
-        mx.async_eval(self._next_tokens, self._next_logprobs)
+        mx.async_eval(self._next_tokens, *self._next_logprobs)
 
     current_lp = self._current_logprobs
     if isinstance(current_lp, mx.array):

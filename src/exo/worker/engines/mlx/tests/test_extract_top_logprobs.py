@@ -5,7 +5,10 @@ from unittest.mock import MagicMock
 import mlx.core as mx
 import pytest
 
-from exo.worker.engines.mlx.patches.opt_batch_gen import _apply_logits_processors
+from exo.worker.engines.mlx.patches.opt_batch_gen import (
+    _apply_logits_processors,
+    _patched_step,
+)
 from exo.worker.engines.mlx.generator.generate import extract_top_logprobs
 
 
@@ -84,3 +87,37 @@ def test_apply_logits_processors_skips_none_entries() -> None:
     )
 
     assert processed.tolist() == [[1.0, 2.0], [4.0, 5.0]]
+
+
+def test_patched_step_keeps_logprob_buffers_list_like() -> None:
+    class Batch:
+        def __init__(self) -> None:
+            self.prompt_cache = []
+            self.tokens = [[], []]
+            self.uids = [10, 11]
+            self.logits_processors = []
+            self.samplers = []
+            self.fallback_sampler = lambda lp: mx.argmax(lp, axis=-1)
+            self._current_tokens = None
+            self._current_logprobs = []
+            self._next_tokens = mx.array([0, 1])
+            self._next_logprobs = []
+
+        def model(self, inputs: mx.array, cache: list) -> mx.array:
+            logits = mx.array(
+                [
+                    [[5.0, 1.0, 0.0]],
+                    [[0.0, 5.0, 1.0]],
+                ],
+                dtype=mx.float32,
+            )
+            return logits
+
+    batch = Batch()
+
+    _patched_step(batch)  # type: ignore[arg-type]
+    assert isinstance(batch._next_logprobs, list)
+
+    _patched_step(batch)  # type: ignore[arg-type]
+    assert isinstance(batch._current_logprobs, list)
+    assert isinstance(batch._next_logprobs, list)
