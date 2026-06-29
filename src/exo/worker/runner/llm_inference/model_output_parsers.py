@@ -431,7 +431,7 @@ def parse_tool_calls(
         if parsed is None or _tool_call_contains_control_markup(parsed):
             logger.warning(f"tool call parsing failed for text {text}")
             return response.model_copy(
-                update={"text": text, "token": 0, "finish_reason": "error"}
+                update={"text": text, "token": 0, "finish_reason": "stop"}
             )
         return ToolCallResponse(
             tool_calls=parsed,
@@ -469,7 +469,7 @@ def parse_tool_calls(
                     update={
                         "text": tool_call_text,
                         "token": 0,
-                        "finish_reason": "error",
+                        "finish_reason": "stop",
                     }
                 )
                 break
@@ -493,7 +493,7 @@ def parse_tool_calls(
                         update={
                             "text": tool_call_text,
                             "token": 0,
-                            "finish_reason": "error",
+                            "finish_reason": "stop",
                         }
                     )
             else:
