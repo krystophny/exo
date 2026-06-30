@@ -160,7 +160,14 @@ class PipelineLastLayer(CustomMlxLayer):
             x, *args, **kwargs
         ).arguments.get("cache", None)
 
-        output: mx.array = self.original_layer(x, *args, **kwargs)
+        result = cast(object, self.original_layer(x, *args, **kwargs))
+        if isinstance(result, tuple):
+            tuple_result = cast(tuple[mx.array, ...], result)
+            output: mx.array = tuple_result[0]
+            extras: tuple[mx.array, ...] = tuple_result[1:]
+        else:
+            output = cast(mx.array, result)
+            extras = ()
 
         # Eval layer output to materialize it before send — this splits the graph
         # so the send is isolated and the receiving rank's recv can complete.
@@ -191,6 +198,8 @@ class PipelineLastLayer(CustomMlxLayer):
             ]
             mx.eval(output)
 
+        if extras:
+            return cast(mx.array, cast(object, (output, *extras)))
         return output
 
 
