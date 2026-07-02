@@ -54,6 +54,7 @@ from exo.worker.engines.mlx.constants import (
     KV_BITS,
     KV_GROUP_SIZE,
     MAX_TOKENS,
+    mlx_prefill_step_size,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
 from exo.worker.engines.mlx.types import KVCacheType, Model
@@ -331,7 +332,7 @@ def prefill(
 
     is_pipeline = _has_pipeline_communication_layer(model)
 
-    prefill_step_size = 4096
+    prefill_step_size = mlx_prefill_step_size()
 
     try:
         if is_pipeline and num_tokens >= prefill_step_size:
