@@ -3,15 +3,23 @@ import os
 # TODO: Do we want so many constants?
 #  I think we want a lot of these as parameters?
 
-def mlx_prefill_step_size(default: int = 4096) -> int:
-    value = os.environ.get("EXO_MLX_PREFILL_STEP_SIZE")
-    if value is None:
-        return default
+
+def _positive_int(value: str) -> int | None:
     try:
         step = int(value)
     except ValueError:
-        return default
-    return step if step > 0 else default
+        return None
+    return step if step > 0 else None
+
+
+def mlx_prefill_step_size(default: int = 4096) -> int:
+    for name in ("EXO_PREFILL_STEP_SIZE", "EXO_MLX_PREFILL_STEP_SIZE"):
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        if step := _positive_int(value):
+            return step
+    return default
 
 
 KV_GROUP_SIZE: int | None = 32
