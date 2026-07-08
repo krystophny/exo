@@ -499,6 +499,26 @@ def _v4_reasoning_effort(task_params: TextGenerationTaskParams) -> str | None:
     return None
 
 
+def _hy3_reasoning_effort(task_params: TextGenerationTaskParams) -> str | None:
+    """Map exo reasoning effort onto Hy3's template vocabulary.
+
+    Hy3's chat template accepts only no_think/low/high and raises on any other
+    value, including exo's "medium" default. An unmapped value reaching the
+    template crashes the runner, so return None to omit it (the template then
+    defaults to no_think).
+    """
+    if task_params.enable_thinking is False:
+        return "no_think"
+    effort = task_params.reasoning_effort
+    if effort in ("high", "xhigh"):
+        return "high"
+    if effort in ("low", "medium", "minimal"):
+        return "low"
+    if effort == "none":
+        return "no_think"
+    return None
+
+
 def _strip_v4_thinking_markers(content: str) -> str:
     """Remove `<think>…</think>` blocks and any stray `<think>`/`</think>` tags
     from prior-turn assistant content.
@@ -624,7 +644,11 @@ def render_chat_template(
         # Jinja ignores unknown variables, so passing both is safe.
         extra_kwargs["enable_thinking"] = task_params.enable_thinking
         extra_kwargs["thinking"] = task_params.enable_thinking
-    if task_params.reasoning_effort is not None:
+    if "hy3" in task_params.model.lower():
+        hy3_effort = _hy3_reasoning_effort(task_params)
+        if hy3_effort is not None:
+            extra_kwargs["reasoning_effort"] = hy3_effort
+    elif task_params.reasoning_effort is not None:
         extra_kwargs["reasoning_effort"] = task_params.reasoning_effort
 
     patched_template: str | None = None
