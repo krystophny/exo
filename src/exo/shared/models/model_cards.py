@@ -286,6 +286,7 @@ class ConfigData(BaseModel):
         return self.architectures in [
             ["Glm4MoeLiteForCausalLM"],
             ["GlmMoeDsaForCausalLM"],
+            ["HYV3ForCausalLM"],
             ["DeepseekV4ForCausalLM"],
             ["DeepseekV32ForCausalLM"],
             ["DeepseekV3ForCausalLM"],

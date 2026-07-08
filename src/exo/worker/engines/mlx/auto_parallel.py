@@ -28,6 +28,8 @@ from mlx_lm.models.glm4_moe_lite import Glm4MoeLiteDecoderLayer, Glm4MoeLiteMLP
 from mlx_lm.models.glm4_moe_lite import Model as GLM4MoeLiteModel
 from mlx_lm.models.gpt_oss import GptOssMoeModel
 from mlx_lm.models.gpt_oss import Model as GptOssModel
+from mlx_lm.models.hy_v3 import MLP as HYV3MLP
+from mlx_lm.models.hy_v3 import Model as HYV3Model
 from mlx_lm.models.kimi_k25 import Model as KimiK25Model
 from mlx_lm.models.llama import Model as LlamaModel
 from mlx_lm.models.minimax import MiniMaxAttention
@@ -554,6 +556,14 @@ def tensor_auto_parallel(
             all_to_sharded_linear_in_place,
             sharded_to_all_linear_in_place,
         )
+    elif isinstance(model, HYV3Model):
+        tensor_parallel_sharding_strategy = HYV3ShardingStrategy(
+            group,
+            all_to_sharded_linear,
+            sharded_to_all_linear,
+            all_to_sharded_linear_in_place,
+            sharded_to_all_linear_in_place,
+        )
     elif isinstance(
         model,
         (
@@ -1005,6 +1015,53 @@ class GLM4MoeLiteShardingStrategy(TensorParallelShardingStrategy):
             mx.eval(layer)
             mx.clear_cache()
 
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
+
+        return model
+
+
+class HYV3ShardingStrategy(TensorParallelShardingStrategy):
+    def shard_model(
+        self,
+        model: nn.Module,
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
+        model = cast(HYV3Model, model)
+        total = len(model.layers)
+        for i, layer in enumerate(model.layers):
+            mx.eval(layer.parameters())
+            layer.self_attn.q_proj = self.all_to_sharded_linear(
+                layer.self_attn.q_proj
+            )
+            layer.self_attn.k_proj = self.all_to_sharded_linear(
+                layer.self_attn.k_proj
+            )
+            layer.self_attn.v_proj = self.all_to_sharded_linear(
+                layer.self_attn.v_proj
+            )
+            layer.self_attn.o_proj = self.sharded_to_all_linear(
+                layer.self_attn.o_proj
+            )
+            layer.self_attn.n_heads //= self.N
+            layer.self_attn.n_kv_heads = max(1, layer.self_attn.n_kv_heads // self.N)
+
+            if isinstance(layer.mlp, HYV3MLP):
+                layer.mlp.gate_proj = self.all_to_sharded_linear(layer.mlp.gate_proj)
+                layer.mlp.down_proj = self.sharded_to_all_linear(layer.mlp.down_proj)
+                layer.mlp.up_proj = self.all_to_sharded_linear(layer.mlp.up_proj)
+            else:
+                layer.mlp.sharding_group = self.group
+                if layer.mlp.shared_mlp is not None:
+                    self.all_to_sharded_linear_in_place(layer.mlp.shared_mlp.gate_proj)
+                    self.sharded_to_all_linear_in_place(
+                        layer.mlp.shared_mlp.down_proj
+                    )
+                    self.all_to_sharded_linear_in_place(layer.mlp.shared_mlp.up_proj)
+                self.all_to_sharded_linear_in_place(layer.mlp.switch_mlp.gate_proj)
+                self.sharded_to_all_linear_in_place(layer.mlp.switch_mlp.down_proj)
+                self.all_to_sharded_linear_in_place(layer.mlp.switch_mlp.up_proj)
+
+            mx.eval(layer)
+            mx.clear_cache()
             yield ModelLoadingResponse(layers_loaded=i, total=total)
 
         return model

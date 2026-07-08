@@ -13,8 +13,22 @@ from exo.worker.engines.mlx.auto_parallel import (
     PipelineFirstLayer,
     PipelineLastLayer,
     patch_pipeline_model,
+    tensor_auto_parallel,
 )
 from exo.worker.tests.unittests.test_mlx.conftest import MockLayer
+
+
+def _finish_tensor_auto_parallel(
+    model: mlx_nn.Module,
+    group: mx.distributed.Group,
+) -> tuple[Any, list[Any]]:
+    yielded: list[Any] = []
+    generator = tensor_auto_parallel(model, group)
+    while True:
+        try:
+            yielded.append(next(generator))
+        except StopIteration as exc:
+            return exc.value, yielded
 
 
 def run_pipeline_device(
@@ -91,6 +105,44 @@ def test_missing_attribute_raises() -> None:
 
     with pytest.raises(AttributeError):
         _ = wrapped.nonexistent_attr  # type: ignore[attr-defined]
+
+
+def test_tensor_auto_parallel_supports_hy3() -> None:
+    from mlx_lm.models.hy_v3 import MLP as HYV3MLP
+    from mlx_lm.models.hy_v3 import Model as HYV3Model
+    from mlx_lm.models.hy_v3 import ModelArgs as HYV3ModelArgs
+    from mlx_lm.models.hy_v3 import MoE as HYV3MoE
+
+    group = mx.distributed.init()
+    model = HYV3Model(
+        HYV3ModelArgs(
+            model_type="hy_v3",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=8,
+            num_experts=4,
+            num_experts_per_tok=2,
+            num_shared_experts=1,
+            expert_hidden_dim=32,
+            first_k_dense_replace=1,
+            rms_norm_eps=1e-6,
+            rope_parameters={"rope_theta": 10000.0},
+        )
+    )
+
+    parallel_model, loaded = _finish_tensor_auto_parallel(model, group)
+
+    assert parallel_model is model
+    assert len(loaded) == 2
+    assert model.model.layers[0].self_attn.n_heads == 8 // group.size()
+    assert model.model.layers[0].self_attn.n_kv_heads == max(1, 2 // group.size())
+    assert isinstance(model.model.layers[0].mlp, HYV3MLP)
+    assert isinstance(model.model.layers[1].mlp, HYV3MoE)
+    assert model.model.layers[1].mlp.sharding_group is group
 
 
 def test_composed_call_works() -> None:
