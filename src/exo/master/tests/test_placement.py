@@ -35,7 +35,7 @@ from exo.shared.types.text_generation import (
     InputMessageContent,
     TextGenerationTaskParams,
 )
-from exo.shared.types.topology import Connection, SocketConnection
+from exo.shared.types.topology import Connection, RDMAConnection, SocketConnection
 from exo.shared.types.worker.downloads import (
     DownloadCompleted,
     DownloadFailed,
@@ -521,6 +521,92 @@ def test_tensor_rdma_backend_connectivity_matrix(
         else:
             ip_part = coordinator.split(":")[0]
             assert len(ip_part.split(".")) == 4
+
+
+def test_tensor_rdma_backend_rejects_nonreciprocal_rdma(
+    model_card: ModelCard,
+):
+    topology = Topology()
+    model_card = model_card.model_copy(
+        update={"n_layers": 12, "storage_size": Memory.from_bytes(1000)}
+    )
+
+    node_a = NodeId()
+    node_b = NodeId()
+    node_memory = {
+        node_a: create_node_memory(500),
+        node_b: create_node_memory(500),
+    }
+    node_network = {
+        node_a: NodeNetworkInfo(
+            interfaces=[NetworkInterfaceInfo(name="en0", ip_address="10.0.0.1")]
+        ),
+        node_b: NodeNetworkInfo(
+            interfaces=[NetworkInterfaceInfo(name="en0", ip_address="10.0.0.2")]
+        ),
+    }
+    topology.add_node(node_a)
+    topology.add_node(node_b)
+    topology.add_connection(
+        Connection(
+            source=node_a,
+            sink=node_b,
+            edge=RDMAConnection(
+                source_rdma_iface="rdma_en3",
+                sink_rdma_iface="rdma_en4",
+            ),
+        )
+    )
+    topology.add_connection(
+        Connection(
+            source=node_b,
+            sink=node_a,
+            edge=RDMAConnection(
+                source_rdma_iface="rdma_en5",
+                sink_rdma_iface="rdma_en3",
+            ),
+        )
+    )
+    topology.add_connection(
+        Connection(
+            source=node_a,
+            sink=node_b,
+            edge=SocketConnection(
+                sink_multiaddr=Multiaddr(address="/ip4/10.0.0.2/tcp/8000")
+            ),
+        )
+    )
+    topology.add_connection(
+        Connection(
+            source=node_b,
+            sink=node_a,
+            edge=SocketConnection(
+                sink_multiaddr=Multiaddr(address="/ip4/10.0.0.1/tcp/8000")
+            ),
+        )
+    )
+    command = PlaceInstance(
+        sharding=Sharding.Tensor,
+        instance_meta=InstanceMeta.MlxJaccl,
+        command_id=CommandId(),
+        model_card=model_card,
+        min_nodes=2,
+    )
+    node_rdma_ctl = {
+        node_a: NodeRdmaCtlStatus(enabled=True),
+        node_b: NodeRdmaCtlStatus(enabled=True),
+    }
+
+    with pytest.raises(ValueError, match="reciprocal all-to-all RDMA"):
+        place_instance(
+            command,
+            topology,
+            {},
+            node_memory,
+            node_network,
+            _metal_only(node_memory),
+            node_rdma_ctl=node_rdma_ctl,
+        )
 
 
 def _build_three_node_rdma_topology() -> tuple[

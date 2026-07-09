@@ -313,13 +313,25 @@ def get_mlx_jaccl_devices_matrix(
             if i == j:
                 continue
 
-            for conn in cycle_digraph.get_all_connections_between(node_i, node_j):
-                if isinstance(conn, RDMAConnection):
-                    matrix[i][j] = conn.source_rdma_iface
+            for forward in cycle_digraph.get_all_connections_between(node_i, node_j):
+                if not isinstance(forward, RDMAConnection):
+                    continue
+
+                for reverse in cycle_digraph.get_all_connections_between(
+                    node_j, node_i
+                ):
+                    if (
+                        isinstance(reverse, RDMAConnection)
+                        and reverse.source_rdma_iface == forward.sink_rdma_iface
+                        and reverse.sink_rdma_iface == forward.source_rdma_iface
+                    ):
+                        matrix[i][j] = forward.source_rdma_iface
+                        break
+                if matrix[i][j] is not None:
                     break
             else:
                 raise ValueError(
-                    "Current jaccl backend requires all-to-all RDMA connections"
+                    "Current jaccl backend requires reciprocal all-to-all RDMA connections"
                 )
 
     return matrix
