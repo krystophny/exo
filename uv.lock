@@ -540,7 +540,7 @@ requires-dist = [
     { name = "mlx-cuda-12", marker = "platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'mlx-cuda12'", url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx_cuda_12-0.32.0-py3-none-manylinux_2_35_x86_64.whl" },
     { name = "mlx-cuda-13", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'mlx-cuda13'", url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx_cuda_13-0.32.0-py3-none-manylinux_2_35_aarch64.whl" },
     { name = "mlx-cuda-13", marker = "platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'mlx-cuda13'", url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx_cuda_13-0.32.0-py3-none-manylinux_2_35_x86_64.whl" },
-    { name = "mlx-lm", marker = "extra == 'mlx'", git = "https://github.com/krystophny/mlx-lm?rev=7bea7d452d4e1dd7b3e2602b54faf6497bbe6598" },
+    { name = "mlx-lm", marker = "extra == 'mlx'", git = "https://github.com/krystophny/mlx-lm?rev=be418ae624f92c87823d2001167a1284b4ed9ebe" },
     { name = "mlx-vlm", marker = "extra == 'mlx'", specifier = ">=0.3.11" },
     { name = "msgspec", specifier = ">=0.19.0" },
     { name = "nanobind", marker = "extra == 'build'" },
@@ -1546,7 +1546,7 @@ requires-dist = [
 [[package]]
 name = "mlx-lm"
 version = "0.31.3"
-source = { git = "https://github.com/krystophny/mlx-lm?rev=7bea7d452d4e1dd7b3e2602b54faf6497bbe6598#7bea7d452d4e1dd7b3e2602b54faf6497bbe6598" }
+source = { git = "https://github.com/krystophny/mlx-lm?rev=be418ae624f92c87823d2001167a1284b4ed9ebe#be418ae624f92c87823d2001167a1284b4ed9ebe" }
 dependencies = [
     { name = "jinja2", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-3-exo-mlx-cpu' and extra == 'extra-3-exo-mlx-cuda12') or (extra == 'extra-3-exo-mlx-cpu' and extra == 'extra-3-exo-mlx-cuda13') or (extra == 'extra-3-exo-mlx-cpu' and extra == 'extra-3-exo-mlx-none') or (extra == 'extra-3-exo-mlx-cuda12' and extra == 'extra-3-exo-mlx-cuda13') or (extra == 'extra-3-exo-mlx-cuda12' and extra == 'extra-3-exo-mlx-none') or (extra == 'extra-3-exo-mlx-cuda13' and extra == 'extra-3-exo-mlx-none')" },
     { name = "mlx", version = "0.32.0.dev20260709+5b29f745", source = { git = "https://github.com/krystophny/mlx-jaccl-fix-small-recv.git?rev=5b29f745b7501eb2f1d4ed6a10e1cad995d6341b#5b29f745b7501eb2f1d4ed6a10e1cad995d6341b" }, marker = "sys_platform == 'darwin' or (extra == 'extra-3-exo-mlx-cpu' and extra == 'extra-3-exo-mlx-cuda12') or (extra == 'extra-3-exo-mlx-cpu' and extra == 'extra-3-exo-mlx-cuda13') or (extra == 'extra-3-exo-mlx-cpu' and extra == 'extra-3-exo-mlx-none') or (extra == 'extra-3-exo-mlx-cuda12' and extra == 'extra-3-exo-mlx-cuda13') or (extra == 'extra-3-exo-mlx-cuda12' and extra == 'extra-3-exo-mlx-none') or (extra == 'extra-3-exo-mlx-cuda13' and extra == 'extra-3-exo-mlx-none')" },
