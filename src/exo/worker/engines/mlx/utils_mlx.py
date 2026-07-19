@@ -492,7 +492,7 @@ def _needs_v4_encoding(task_params: TextGenerationTaskParams) -> bool:
 
 def _v4_reasoning_effort(task_params: TextGenerationTaskParams) -> str | None:
     effort = task_params.reasoning_effort
-    if effort == "xhigh":
+    if effort in ("xhigh", "max"):
         return "max"
     if effort == "high":
         return "high"
@@ -510,7 +510,7 @@ def _hy3_reasoning_effort(task_params: TextGenerationTaskParams) -> str | None:
     if task_params.enable_thinking is False:
         return "no_think"
     effort = task_params.reasoning_effort
-    if effort in ("high", "xhigh"):
+    if effort in ("high", "xhigh", "max"):
         return "high"
     if effort in ("low", "medium", "minimal"):
         return "low"

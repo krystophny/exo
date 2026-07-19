@@ -12,7 +12,9 @@ from exo.shared.logging import logger
 from exo.shared.types.common import ModelId, TruncatingString
 
 MessageRole = Literal["user", "assistant", "system", "developer", "tool"]
-ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
+ReasoningEffort = Literal[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max"
+]
 # How a model wants prior-turn reasoning content handled. Drives both the
 # server-side encoder (drop vs keep) and the integration configs we emit
 # (e.g. opencode's per-model `interleaved` flag).

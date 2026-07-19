@@ -62,6 +62,14 @@ def test_hy3_high_effort_maps_to_high() -> None:
     assert tok.seen["reasoning_effort"] == "high"
 
 
+def test_hy3_max_effort_maps_to_high() -> None:
+    tok = _Hy3Tokenizer()
+    render_chat_template(
+        tok, list(_MESSAGES), _params("kernelpool/Hy3-6bit", reasoning_effort="max")
+    )
+    assert tok.seen["reasoning_effort"] == "high"
+
+
 def test_hy3_thinking_disabled_maps_to_no_think() -> None:
     tok = _Hy3Tokenizer()
     render_chat_template(
@@ -78,3 +86,13 @@ def test_non_hy3_effort_passes_through_unchanged() -> None:
         _params("mlx-community/GLM-5.2-mxfp4", reasoning_effort="medium"),
     )
     assert tok.seen["reasoning_effort"] == "medium"
+
+
+def test_glm_max_effort_passes_through_unchanged() -> None:
+    tok = _RecordingTokenizer()
+    render_chat_template(
+        tok,
+        list(_MESSAGES),
+        _params("mlx-community/GLM-5.2-mxfp4", reasoning_effort="max"),
+    )
+    assert tok.seen["reasoning_effort"] == "max"
