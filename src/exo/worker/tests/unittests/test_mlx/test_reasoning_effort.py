@@ -96,3 +96,16 @@ def test_glm_max_effort_passes_through_unchanged() -> None:
         _params("mlx-community/GLM-5.2-mxfp4", reasoning_effort="max"),
     )
     assert tok.seen["reasoning_effort"] == "max"
+
+
+def test_minimax_thinking_mode_passes_through_unchanged() -> None:
+    tok = _RecordingTokenizer()
+    render_chat_template(
+        tok,
+        list(_MESSAGES),
+        _params(
+            "mlx-community/MiniMax-M3-4bit",
+            chat_template_kwargs={"thinking_mode": "enabled"},
+        ),
+    )
+    assert tok.seen["thinking_mode"] == "enabled"
