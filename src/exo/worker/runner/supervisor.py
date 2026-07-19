@@ -286,7 +286,10 @@ class RunnerSupervisor:
                 f"Skipping invalid task {task} as it has already been completed"
             )
             return
-        logger.info(f"Starting task {task}")
+        logger.info(
+            f"Starting task type={type(task).__name__} "
+            f"task_id={task.task_id} instance_id={task.instance_id}"
+        )
         event = anyio.Event()
         self.pending[task.task_id] = event
         self.in_progress[task.task_id] = task
@@ -294,7 +297,11 @@ class RunnerSupervisor:
             await self._task_sender.send_async(task)
         except ClosedResourceError:
             self.in_progress.pop(task.task_id, None)
-            logger.warning(f"Task {task} dropped, runner closed communication.")
+            logger.warning(
+                f"Task dropped after runner communication closed: "
+                f"type={type(task).__name__} task_id={task.task_id} "
+                f"instance_id={task.instance_id}"
+            )
             return
         await event.wait()
 
