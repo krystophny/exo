@@ -81,7 +81,7 @@ members = ["rust/exo_rs", "bench", "tools"]
 [tool.uv.sources]
 exo-rs = { workspace = true }
 mlx = [
-  { git = "https://github.com/krystophny/mlx-jaccl-fix-small-recv.git", rev = "3eb056091c68026d6715cf8dfffc070044f6dd70", marker = "sys_platform == 'darwin'" },
+  { git = "https://github.com/krystophny/mlx-jaccl-fix-small-recv.git", rev = "f26863d655a85f0fded2e72e3c563f9c090bd18c", marker = "sys_platform == 'darwin'" },
   { url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx-0.32.0-cp313-cp313-manylinux_2_35_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
   { url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx-0.32.0-cp313-cp313-manylinux_2_35_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine != 'aarch64'" },
 ]
