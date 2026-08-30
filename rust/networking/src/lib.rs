@@ -94,9 +94,16 @@ pub async fn open(
                 continue;
             };
 
-            runtime
-                .connect_peer(&discovered.zid.into(), &[locator])
-                .await;
+            // connect_peer can block for a long time (or indefinitely) when a
+            // peer is unreachable or its handshake stalls. Awaiting it here
+            // stops this task from returning to Discovery::next(), which is the
+            // only thing that drives announce() - so a single slow peer
+            // silences discovery for the whole node. Connect off-task instead.
+            let rt = runtime.clone();
+            let zid = discovered.zid;
+            tokio::task::spawn(async move {
+                rt.connect_peer(&zid.into(), &[locator]).await;
+            });
         }
     })));
     Ok(Session { z, _jh })
