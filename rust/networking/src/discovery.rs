@@ -17,6 +17,8 @@ use zenoh::config::ZenohId;
 
 const GROUP: Ipv6Addr = Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0xe0a1, 0xde89);
 const MAGIC: [u8; 3] = *b"EXO";
+/// Per-interface cap on a single announcement send.
+const SEND_TIMEOUT: Duration = Duration::from_millis(50);
 
 pub struct Discovery {
     sock: Arc<UdpSocket>,
@@ -265,16 +267,27 @@ impl Discovery {
             // set per send, otherwise every datagram leaves via the default
             // multicast interface regardless of the address it was sent to.
             if let Err(e) = sref.set_multicast_if_v6(addr.scope_id()) {
-                debug!("could not set multicast egress iface {}: {e}", addr.scope_id());
+                debug!(
+                    "could not set multicast egress iface {}: {e}",
+                    addr.scope_id()
+                );
                 continue;
             }
-            match self.sock.send_to(&buf, addr).await {
-                Ok(bytes) => trace!("sent {bytes} to {addr}"),
-                Err(e) if e.kind() == io::ErrorKind::HostUnreachable => {
+            // Bound each send. Awaiting send_to unbounded lets a single
+            // interface whose transmit queue never drains (a tunnel with no
+            // reader, e.g. utun*) block this task forever - and because next()
+            // is the only driver of announce() AND of recv_from, that silences
+            // discovery for the whole node permanently. Announcements are
+            // periodic and idempotent, so skipping a congested interface for
+            // this tick is the correct trade.
+            match tokio::time::timeout(SEND_TIMEOUT, self.sock.send_to(&buf, addr)).await {
+                Ok(Ok(bytes)) => trace!("sent {bytes} to {addr}"),
+                Ok(Err(e)) if e.kind() == io::ErrorKind::HostUnreachable => {
                     debug!("disabling discovery address {addr}: {e}");
                     _ = self.ifaces.lock().swap_remove(i);
                 }
-                Err(e) => debug!("failed to reach {addr}: {e}"),
+                Ok(Err(e)) => debug!("failed to reach {addr}: {e}"),
+                Err(_elapsed) => trace!("timed out sending to {addr}; skipped this tick"),
             }
         }
         Ok(())
