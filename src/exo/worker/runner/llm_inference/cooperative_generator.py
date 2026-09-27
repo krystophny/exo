@@ -224,7 +224,10 @@ class CooperativeGenerator(SequentialGenerator):
             mx.array(row, dtype=mx.int64), group=self.group
         )
         return cast(
-            list[list[int]], gathered.reshape(self.group.size(), len(row)).tolist()
+            list[list[int]],
+            gathered.reshape(
+                self.group.size(), len(row), stream=mx.Device(mx.cpu)
+            ).tolist(),
         )
 
     def _admit_memory(self, chosen: int, requested: int, idle: list[_Slot]) -> bool:
@@ -398,7 +401,9 @@ class CooperativeGenerator(SequentialGenerator):
                 )
                 rows = cast(
                     list[list[int]],
-                    gathered.reshape(self.group.size(), len(scores) * 2).tolist(),
+                    gathered.reshape(
+                        self.group.size(), len(scores) * 2, stream=mx.Device(mx.cpu)
+                    ).tolist(),
                 )
                 if any(row != rows[0] for row in rows[1:]):
                     for candidate in idle:

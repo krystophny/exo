@@ -982,7 +982,7 @@ def finish_task_gather(
     gathered = cast(
         list[list[list[int]]],
         mx.distributed.all_gather(mx.array(padded), group=group)
-        .reshape(world_size, max_tasks, -1)
+        .reshape(world_size, max_tasks, -1, stream=mx.Device(mx.cpu))
         .tolist(),
     )
     all_task_ids: list[list[TaskId]] = [
