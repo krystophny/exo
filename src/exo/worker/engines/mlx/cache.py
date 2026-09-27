@@ -109,14 +109,16 @@ def copy_rotating_kv_cache(cache: RotatingKVCache) -> RotatingKVCache | None:
 
 def _copy_arrays_cache(ac: ArraysCache) -> ArraysCache:
     entries: list[mx.array | None] = []
-    for entry in ac.cache:  # type: ignore[reportUnknownMemberType]
+    for entry in ac.cache:
         if entry is None:
             entries.append(None)
             continue
         assert isinstance(entry, mx.array)
         entries.append(_detached_copy(entry))
     copy = ArraysCache(len(entries))
-    copy.cache = entries  # type: ignore[reportUnknownMemberType]
+    copy.cache = entries
+    copy.left_padding = _detached_copy_or_none(ac.left_padding)
+    copy.lengths = _detached_copy_or_none(ac.lengths)
     return copy
 
 

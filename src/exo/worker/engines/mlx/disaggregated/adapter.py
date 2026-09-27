@@ -139,7 +139,9 @@ def send_mlx_kv_cache(
                 tokens_sent = num_tokens
             case ArraysCache():
                 blobs: list[TensorBlob] = []
-                for a in c.state:
+                if c.left_padding is not None or c.lengths is not None:
+                    raise ValueError("Batched array caches cannot be transferred")
+                for a in c.cache:
                     if a is None:
                         continue
                     with mx.stream(mx.Device(mx.cpu)):
@@ -205,7 +207,7 @@ def inject_rotating_kv_chunk(
 
 
 def inject_arrays_cache(cache: ArraysCache, blobs: list[TensorBlob]) -> None:
-    cache.state = [blob_to_mlx(b) for b in blobs]
+    cache.state = ([blob_to_mlx(b) for b in blobs], None, None)
 
 
 def write_cache_to_wire(

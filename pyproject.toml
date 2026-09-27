@@ -35,42 +35,28 @@ exo = "exo.main:main"
 # dependencies only required for development
 [dependency-groups]
 dev = [
-  "basedpyright>=1.29.0",
+  "basedpyright>=1.37.1",
   "pyinstaller>=6.17.0",
   "playwright>=1.52.0",
-  "pytest>=8.4.0",
+  "pytest==9.0.2",
   "pytest-asyncio>=1.0.0",
   "pytest-env",
-  "ruff>=0.11.13",
+  "httpx2",                # Starlette 1.x TestClient transport
+  "ruff==0.14.11",
 ]
 
 [project.optional-dependencies]
 build = ["nanobind"]
 mlx-none = ["anyio"]
 mlx = [
-  "mlx==0.32.0",
+  "mlx>=0.32.3.dev20260927; sys_platform == 'darwin'",
   "mlx-lm",
   "mlx-vlm>=0.3.11",
   "mflux==0.17.5",
   "torch==2.10.0; sys_platform == 'darwin'",
-  "torch==2.10.0; sys_platform == 'linux'",
   "torchaudio==2.10.0; sys_platform == 'darwin'",
-  "torchaudio==2.10.0; sys_platform == 'linux'",
   "torchvision==0.25.0; sys_platform == 'darwin'",
-  "torchvision==0.25.0; sys_platform == 'linux'",
 ]
-mlx-cpu = ["exo[mlx]", "mlx-cpu==0.31.2; sys_platform == 'linux'"]
-mlx-cuda12 = [
-  "exo[mlx]",
-  "mlx-cuda-12==0.32.0; sys_platform == 'linux'",
-  "nvidia-ml-py>=13.595.45",
-]
-mlx-cuda13 = [
-  "exo[mlx]",
-  "mlx-cuda-13==0.32.0; sys_platform == 'linux'",
-  "nvidia-ml-py>=13.595.45",
-]
-
 ###
 # workspace configuration
 ###
@@ -80,52 +66,9 @@ members = ["rust/exo_rs", "bench", "tools"]
 
 [tool.uv.sources]
 exo-rs = { workspace = true }
-mlx = [
-  { git = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv.git", branch = "address-rdma-gpu-locks", marker = "sys_platform == 'darwin'" },
-  { url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx-0.32.0-cp313-cp313-manylinux_2_35_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
-  { url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx-0.32.0-cp313-cp313-manylinux_2_35_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine != 'aarch64'" },
-]
-mlx-cuda-12 = [
-  { url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx_cuda_12-0.32.0-py3-none-manylinux_2_35_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
-  { url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx_cuda_12-0.32.0-py3-none-manylinux_2_35_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine != 'aarch64'" },
-]
-mlx-cuda-13 = [
-  { url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx_cuda_13-0.32.0-py3-none-manylinux_2_35_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
-  { url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx_cuda_13-0.32.0-py3-none-manylinux_2_35_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine != 'aarch64'" },
-]
-mlx-lm = { git = "https://github.com/rltakashige/mlx-lm", branch = "leo/deepseek-v4" }
+mlx = { git = "https://github.com/krystophny/mlx-jaccl-fix-small-recv", rev = "1d4368eb7006be8104c11950ade3ae835fe65396" }
+mlx-lm = { git = "https://github.com/krystophny/mlx-lm", rev = "5cd9cf68c260e87438749afbb95bcb272198e690" }
 mflux = { git = "https://github.com/evanev7/mflux", branch = "exo2" }
-torch = [
-  { index = "pytorch-cpu", marker = "sys_platform == 'linux' and extra == 'mlx-cpu' and extra != 'mlx-cuda13' and extra != 'mlx-cuda12'" },
-  { index = "pytorch-cu128", marker = "sys_platform == 'linux' and extra == 'mlx-cuda12' and extra != 'mlx-cuda13' " },
-  { index = "pytorch-cu130", marker = "sys_platform == 'linux' and extra == 'mlx-cuda13'" },
-]
-torchvision = [
-  { index = "pytorch-cpu", marker = "sys_platform == 'linux' and extra == 'mlx-cpu' and extra != 'mlx-cuda13' and extra != 'mlx-cuda12'" },
-  { index = "pytorch-cu128", marker = "sys_platform == 'linux' and extra == 'mlx-cuda12' and extra != 'mlx-cuda13'" },
-  { index = "pytorch-cu130", marker = "sys_platform == 'linux' and extra == 'mlx-cuda13'" },
-]
-torchaudio = [
-  { index = "pytorch-cpu", marker = "sys_platform == 'linux' and extra == 'mlx-cpu' and extra != 'mlx-cuda13' and extra != 'mlx-cuda12'" },
-  { index = "pytorch-cu128", marker = "sys_platform == 'linux' and extra == 'mlx-cuda12' and extra != 'mlx-cuda13'" },
-  { index = "pytorch-cu130", marker = "sys_platform == 'linux' and extra == 'mlx-cuda13'" },
-]
-
-[[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
 [build-system]
 requires = ["uv_build>=0.8.9,<0.9.0"]
 build-backend = "uv_build"
@@ -185,16 +128,8 @@ root = "tools/src"
 [tool.uv]
 required-version = ">=0.8.6"
 prerelease = "allow"
-environments = ["sys_platform == 'darwin'", "sys_platform == 'linux'"]
+environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
 override-dependencies = ["opencv-python; python_version < '0'"]
-conflicts = [
-  [
-    { extra = "mlx-cuda13" },
-    { extra = "mlx-cuda12" },
-    { extra = "mlx-cpu" },
-    { extra = "mlx-none" },
-  ],
-]
 
 [tool.uv.extra-build-dependencies]
 miniaudio = ["setuptools", "cffi", "pycparser"]
@@ -246,6 +181,7 @@ extend-exclude = [".typings/**", "rust/exo_rs/**", "bench/vendor/**"]
 extend-select = ["I", "N", "B", "A", "PIE", "SIM"]
 
 [tool.pytest.ini_options]
+testpaths = ["src", "rust/exo_rs/tests"]
 pythonpath = "."
 asyncio_mode = "auto"
 markers = ["slow: marks tests as slow (deselected by default)"]

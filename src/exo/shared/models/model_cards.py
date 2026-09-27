@@ -207,7 +207,7 @@ class ModelCard(FrozenModel):
     async def save(self, path: Path) -> None:
         async with await open_file(path, "w") as f:
             py = self.model_dump(exclude_none=True, exclude={"is_custom"})
-            data = tomlkit.dumps(py)  # pyright: ignore[reportUnknownMemberType]
+            data = tomlkit.dumps(py)
             await f.write(data)
 
     async def save_to_custom_dir(self) -> None:

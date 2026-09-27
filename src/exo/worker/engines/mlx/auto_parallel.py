@@ -1132,8 +1132,17 @@ class QwenShardingStrategy(TensorParallelShardingStrategy):
             | Qwen3VLModel,
             model,
         )
-        total = len(model.layers)
-        for i, layer in enumerate(model.layers):
+        layers = cast(
+            list[
+                Qwen3TransformerBlock
+                | Qwen3MoeDecoderLayer
+                | Qwen3NextDecoderLayer
+                | Qwen3_5DecoderLayer
+            ],
+            get_layers(model),
+        )
+        total = len(layers)
+        for i, layer in enumerate(layers):
             mx.eval(layer.parameters())
             # Shard the self attention
             if isinstance(layer, (Qwen3MoeDecoderLayer, Qwen3TransformerBlock)):
@@ -1257,16 +1266,11 @@ class QwenShardingStrategy(TensorParallelShardingStrategy):
                 self.all_to_sharded_linear_in_place(layer.mlp.switch_mlp.gate_proj)
                 self.sharded_to_all_linear_in_place(layer.mlp.switch_mlp.down_proj)
                 self.all_to_sharded_linear_in_place(layer.mlp.switch_mlp.up_proj)
-                if isinstance(
-                    layer.mlp, (Qwen3NextSparseMoeBlock, Qwen3_5SparseMoeBlock)
-                ):
-                    self.all_to_sharded_linear_in_place(
-                        layer.mlp.shared_expert.gate_proj
-                    )
-                    self.sharded_to_all_linear_in_place(
-                        layer.mlp.shared_expert.down_proj
-                    )
-                    self.all_to_sharded_linear_in_place(layer.mlp.shared_expert.up_proj)
+                moe: object = layer.mlp
+                if isinstance(moe, Qwen3NextSparseMoeBlock):
+                    self.all_to_sharded_linear_in_place(moe.shared_expert.gate_proj)
+                    self.sharded_to_all_linear_in_place(moe.shared_expert.down_proj)
+                    self.all_to_sharded_linear_in_place(moe.shared_expert.up_proj)
                 layer.mlp = ShardedMoE(layer.mlp)  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
                 layer.mlp.sharding_group = self.group
 

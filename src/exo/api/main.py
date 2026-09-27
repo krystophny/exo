@@ -265,7 +265,7 @@ class API:
         self.app = FastAPI()
 
         @self.app.middleware("http")
-        async def _log_requests(  # pyright: ignore[reportUnusedFunction]
+        async def _log_requests(
             request: Request,
             call_next: Callable[[Request], Awaitable[StreamingResponse]],
         ) -> StreamingResponse:
@@ -412,13 +412,13 @@ class API:
         if path == "":
             return self.state
         try:
-            x = self.state.model_dump(by_alias=True)
+            x: object = self.state.model_dump(by_alias=True)
             for attr in path.split("/"):
                 if attr != "":
                     if isinstance(x, dict):
-                        x = x[attr]  # pyright: ignore[reportUnknownVariableType]
+                        x = cast(dict[str, object], x)[attr]
                     elif isinstance(x, list):
-                        x = x[int(attr)]  # pyright: ignore[reportUnknownVariableType]
+                        x = cast(list[object], x)[int(attr)]
             return cast(Any, x)  # pyright: ignore[reportAny]
         except Exception as e:
             raise HTTPException(
