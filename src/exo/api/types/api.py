@@ -256,6 +256,7 @@ class BenchChatCompletionRequest(ChatCompletionRequest):
 
 class AddCustomModelParams(BaseModel):
     model_id: ModelId
+    model_card: ModelCard | None = None
 
 
 class HuggingFaceSearchResult(BaseModel):

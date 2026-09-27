@@ -1819,13 +1819,20 @@ class API:
         )
 
     async def add_custom_model(self, payload: AddCustomModelParams) -> ModelListModel:
-        """Fetch a model from HuggingFace and save as a custom model card, then sync across the cluster."""
-        try:
-            card = await ModelCard.fetch_from_hf(payload.model_id)
-        except Exception as exc:
+        """Register a supplied or fetched model card across the cluster."""
+        card = payload.model_card
+        if card is not None and card.model_id != payload.model_id:
             raise HTTPException(
-                status_code=400, detail=f"Failed to fetch model: {exc}"
-            ) from exc
+                status_code=400, detail="Model card ID must match model_id"
+            )
+        if card is None:
+            try:
+                card = await ModelCard.fetch_from_hf(payload.model_id)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400, detail=f"Failed to fetch model: {exc}"
+                ) from exc
+        card = card.model_copy(update={"is_custom": True})
 
         await self.command_sender.send(
             ForwarderCommand(
