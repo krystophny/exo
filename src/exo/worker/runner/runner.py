@@ -330,7 +330,13 @@ class Runner:
         assert isinstance(self.current_status, RunnerReady)
         assert isinstance(self.generator, Engine)
 
-        logger.info(f"received chat request: {starting_task}")
+        logger.info(
+            "received generation request "
+            f"type={type(starting_task).__name__} "
+            f"task_id={starting_task.task_id} "
+            f"command_id={starting_task.command_id} "
+            f"instance_id={starting_task.instance_id}"
+        )
         self.update_status(RunnerRunning())
         logger.info("runner running")
         self.acknowledge_task(starting_task)
