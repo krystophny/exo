@@ -918,10 +918,20 @@ class API:
         return command
 
     async def chat_completions(
-        self, payload: ChatCompletionRequest
+        self, payload: ChatCompletionRequest, request: Request
     ) -> ChatCompletionResponse | StreamingResponse:
-        """OpenAI Chat Completions API - adapter."""
-        task_params = await chat_request_to_text_generation(payload)
+        """OpenAI Chat Completions API - adapter.
+
+        Cooperative-slot session hints (``X-Slopcode-Session-Class`` /
+        ``X-Slopcode-Session-Key``) are read only from request headers on
+        this private, authenticated native endpoint. They are never taken
+        from the request body, which untrusted callers can shape freely.
+        """
+        session_class = request.headers.get("x-slopcode-session-class")
+        session_key = request.headers.get("x-slopcode-session-key")
+        task_params = await chat_request_to_text_generation(
+            payload, session_class=session_class, session_key=session_key
+        )
         validated_model = await self._validate_model_has_instance(task_params.model)
         task_params = task_params.model_copy(update={"model": validated_model})
 

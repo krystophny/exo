@@ -24,6 +24,7 @@ from exo.worker.runner.llm_inference.tool_parsers import make_mlx_parser
 from .cache import KVPrefixCache
 from .types import Model
 from .utils_mlx import (
+    cooperative_slots,
     initialize_mlx,
     load_mlx_items,
 )
@@ -41,7 +42,7 @@ class MlxBuilder(Builder):
     vision_processor: VisionProcessor | None = None
 
     def connect(self, bound_instance: BoundInstance) -> None:
-        if os.getenv("EXO_COOPERATIVE_SLOTS") == "2" and not isinstance(
+        if cooperative_slots() is not None and not isinstance(
             bound_instance.bound_shard, TensorShardMetadata
         ):
             raise ValueError(
@@ -94,7 +95,8 @@ class MlxBuilder(Builder):
         kv_prefix_cache = KVPrefixCache(self.group)
 
         device_rank = 0 if self.group is None else self.group.rank()
-        if os.getenv("EXO_COOPERATIVE_SLOTS") == "2":
+        slots = cooperative_slots()
+        if slots is not None:
             if self.vision_processor is not None:
                 raise ValueError("Cooperative GLM slots are text-only")
             if (
@@ -119,6 +121,7 @@ class MlxBuilder(Builder):
                 cancel_receiver=self.cancel_receiver,
                 event_sender=self.event_sender,
                 vision_processor=None,
+                num_slots=slots,
             )
         if os.environ.get("EXO_NO_BATCH"):
             logger.info("using SequentialGenerator (batching disabled)")

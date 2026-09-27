@@ -61,6 +61,7 @@ from exo.worker.engines.mlx.mtp import mtp_enabled
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
+    cooperative_slots,
     fix_unmatched_think_end_tokens,
     mx_barrier,
     system_prompt_token_count,
@@ -632,7 +633,7 @@ def mlx_generate(
         top_k=task.top_k if task.top_k is not None else 0,
     )
 
-    if os.getenv("EXO_COOPERATIVE_SLOTS") == "2":
+    if cooperative_slots() is not None:
         from exo.worker.engines.mlx.session_sampling import make_session_sampler
 
         sampler = make_session_sampler(
@@ -751,7 +752,7 @@ def mlx_generate(
             distributed_prompt_progress_callback()
 
     mtp_options: dict[str, object] = {}
-    if os.getenv("EXO_COOPERATIVE_SLOTS") == "2":
+    if cooperative_slots() is not None:
         mtp_options["manage_wired_limit"] = False
     if use_mtp:
         mtp_options.update(

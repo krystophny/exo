@@ -738,6 +738,29 @@ def detect_thinking_prompt_suffix(prompt: str, tokenizer: TokenizerWrapper) -> b
     return think_token is not None and prompt.rstrip().endswith(think_token)
 
 
+def cooperative_slots() -> int | None:
+    """Parse EXO_COOPERATIVE_SLOTS. None means cooperative slots are off.
+
+    Any integer >= 2 is a valid slot count; anything else (unset, non-integer,
+    or < 2) is rejected at startup so a misconfigured deployment fails fast
+    instead of silently falling back to a single owner.
+    """
+    raw = os.getenv("EXO_COOPERATIVE_SLOTS")
+    if raw is None:
+        return None
+    try:
+        slots = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"EXO_COOPERATIVE_SLOTS must be an integer >= 2, got {raw!r}"
+        ) from exc
+    if slots < 2:
+        raise ValueError(
+            f"EXO_COOPERATIVE_SLOTS must be an integer >= 2, got {raw!r}"
+        )
+    return slots
+
+
 def fix_unmatched_think_end_tokens(
     tokens: mx.array, tokenizer: TokenizerWrapper
 ) -> mx.array:

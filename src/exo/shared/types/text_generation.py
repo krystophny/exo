@@ -135,6 +135,12 @@ class TextGenerationTaskParams(BaseModel, frozen=True):
 
     prefill_endpoint: str | None = None
 
+    # Cooperative-slot routing hints, private to the native adapter. Only the
+    # trusted chat_completions adapter sets these from internal request
+    # headers; never accept them from an untrusted client field.
+    session_class: str | None = None
+    session_key: str | None = None
+
     def with_card_sampling_defaults(self) -> "TextGenerationTaskParams":
         from exo.shared.models import model_cards
 

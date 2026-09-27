@@ -99,7 +99,9 @@ def test_warm_prefix_buffers_are_credited_and_cross_owner_alias_rejected(
     allocated, nonoverlap = result._owner_buffers()
     assert nonoverlap and allocated[0] > 0
     # A small request reuses the warm storage without adding another full budget.
-    assert result._admit_memory(0, 65536, list(result._slots))
+    assert result._admit_memory(
+        0, 65536, list(result._slots), list(result._slots)
+    )
     assert prefix.caches[0] is cache
     other = cast(_OwnerPrefixCache, result._slots[1].kv_prefix_cache)
     other.caches.append(cache)
@@ -133,7 +135,7 @@ def test_asymmetric_pressure_has_matching_collectives_and_only_idle_eviction(
         return [local, peer] if rank == 0 else [peer, local]
 
     monkeypatch.setattr(result, "_memory_rows", rows)
-    assert result._admit_memory(1, 65536, [idle_slot])
+    assert result._admit_memory(1, 65536, [idle_slot], [idle_slot])
     assert 1 <= len(gathered) <= 3 and all(row == gathered[0] for row in gathered)
     assert len(idle_prefix.caches) == 1
     assert active_slot._active is active_identity
@@ -162,8 +164,10 @@ def test_failed_kernel_probe_is_unsafe_and_still_enters_fixed_collective(
         return mx.concatenate([row, row])
 
     monkeypatch.setattr(mx.distributed, "all_gather", gather)
-    assert not result._admit_memory(0, 65536, list(result._slots))
-    assert 1 <= len(calls) <= 3 and all(row[0] == 0 for row in calls)
+    assert not result._admit_memory(
+        0, 65536, list(result._slots), list(result._slots)
+    )
+    assert 1 <= len(calls) <= 4 and all(row[0] == 0 for row in calls)
     assert all(row[1:4] == calls[0][1:4] for row in calls)
 
 
@@ -214,10 +218,14 @@ def test_other_idle_eviction_preserves_chosen_warm_cache(
         return [[ready, mask, chosen, requested, 0, 0, 0, 0, 0]]
 
     monkeypatch.setattr(result, "_memory_rows", rows)
-    assert result._admit_memory(0, 65536, list(result._slots))
+    assert result._admit_memory(
+        0, 65536, list(result._slots), list(result._slots)
+    )
     assert selected.caches[0] is warm
     assert other.caches == []
-    assert calls == [3, 3]
+    # One initial mismatch check, one no-op retry (transient-mismatch
+    # tolerance), then one retry after evicting the other idle slot.
+    assert calls == [3, 3, 3]
 
 
 def test_active_decode_does_not_probe_admission(
