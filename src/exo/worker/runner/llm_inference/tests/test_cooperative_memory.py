@@ -13,7 +13,7 @@ from exo.worker.runner.llm_inference.cooperative_memory import (
 
 
 def test_installed_cpu_allocator_oracle_handles_views_aliases_and_lazy_arrays() -> None:
-    measure = cast(Callable[[object], int], cast(object, mx).get_array_buffer_size)
+    measure = cast(Callable[[object], int], vars(mx)["get_array_buffer_size"])
     backing = mx.zeros((1024,), dtype=mx.float32)
     view = backing[:1]
     with pytest.raises(ValueError, match="evaluated"):

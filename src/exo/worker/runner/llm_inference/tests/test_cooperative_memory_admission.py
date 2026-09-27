@@ -12,7 +12,8 @@ import pytest
 from mlx_lm.models.cache import MLACacheList, QuantizedKVCache
 from mlx_lm.models.deepseek_v32 import Model as GlmModel
 
-from exo.shared.types.chunks import GenerationChunk
+from exo.shared.types.chunks import ErrorChunk, GenerationChunk
+from exo.shared.types.events import ChunkGenerated
 from exo.shared.types.tasks import TaskId, TaskStatus
 from exo.shared.types.worker.runner_response import CancelledResponse, FinishedResponse
 from exo.worker.engines.mlx.types import Model
@@ -71,12 +72,20 @@ def engine(monkeypatch: pytest.MonkeyPatch) -> CooperativeGenerator:
 
 def cached(rows: int = 256) -> list[MLACacheList]:
     cache = QuantizedKVCache(group_size=64, bits=8)
-    update = cast(Callable[[mx.array, mx.array], object], cache.update_and_fetch)
-    update(
+    update = cast(
+        Callable[
+            [mx.array, mx.array],
+            tuple[
+                tuple[mx.array, mx.array, mx.array], tuple[mx.array, mx.array, mx.array]
+            ],
+        ],
+        cache.update_and_fetch,
+    )
+    quantized = update(
         mx.zeros((1, 1, rows, 512), dtype=mx.bfloat16),
         mx.zeros((1, 1, rows, 64), dtype=mx.bfloat16),
     )
-    mx.eval(cache.state)
+    mx.eval(quantized)
     return [MLACacheList(cache)]
 
 
@@ -113,7 +122,7 @@ def test_asymmetric_pressure_has_matching_collectives_and_only_idle_eviction(
     active_prefix.active_cache = cache
     idle_prefix.caches.append(cached())
     active_buffers = result._owner_buffers()[0][0]
-    gathered = []
+    gathered: list[tuple[int, int, int]] = []
 
     def rows(chosen: int, requested: int, idle_mask: int) -> list[list[int]]:
         gathered.append((chosen, requested, idle_mask))
@@ -139,11 +148,17 @@ def test_failed_kernel_probe_is_unsafe_and_still_enters_fixed_collective(
     monkeypatch.setattr(module, "capture_physical", lambda: PhysicalSnapshot())
     result.group = Mock()
     cast(Mock, result.group.size).return_value = 2
-    calls = []
+    calls: list[list[int]] = []
 
     def gather(row: mx.array, group: object) -> mx.array:
         assert group is result.group
-        calls.append(row.tolist())
+        values = row.tolist()
+        assert isinstance(values, list)
+        integers: list[int] = []
+        for value in values:
+            assert isinstance(value, int)
+            integers.append(value)
+        calls.append(integers)
         return mx.concatenate([row, row])
 
     monkeypatch.setattr(mx.distributed, "all_gather", gather)
@@ -191,7 +206,7 @@ def test_other_idle_eviction_preserves_chosen_warm_cache(
     warm = cached()
     selected.caches.append(warm)
     other.caches.append(cached())
-    calls = []
+    calls: list[int] = []
 
     def rows(chosen: int, requested: int, mask: int) -> list[list[int]]:
         calls.append(mask)
@@ -213,7 +228,13 @@ def test_active_decode_does_not_probe_admission(
     result._all_tasks[CHAT_TASK.task_id] = CHAT_TASK
     probes = Mock(side_effect=AssertionError("decode probed admission"))
     monkeypatch.setattr(result, "_memory_rows", probes)
-    monkeypatch.setattr(result, "_advance", lambda index: [])
+
+    def no_progress(
+        index: int,
+    ) -> list[tuple[TaskId, GenerationChunk | FinishedResponse | CancelledResponse]]:
+        return []
+
+    monkeypatch.setattr(result, "_advance", no_progress)
     assert list(result.step()) == []
     probes.assert_not_called()
 
@@ -227,14 +248,26 @@ def test_unadmittable_work_errors_when_idle_or_waits_for_active_progress(
     result._all_tasks[CHAT_TASK.task_id] = CHAT_TASK
     if busy:
         result._slots[1]._active = active(CHAT_TASK)
-    monkeypatch.setattr(
-        module.batch_generator, "apply_chat_template", lambda *_: "rendered"
-    )
-    monkeypatch.setattr(module, "encode_prompt", lambda *_: [1, 2])
-    monkeypatch.setattr(
-        module, "fix_unmatched_think_end_tokens", lambda tokens, _: tokens
-    )
-    monkeypatch.setattr(result, "_admit_memory", lambda *_: False)
+
+    def rendered(*args: object) -> str:
+        return "rendered"
+
+    monkeypatch.setattr(module.batch_generator, "apply_chat_template", rendered)
+
+    def tokens(*args: object) -> list[int]:
+        return [1, 2]
+
+    monkeypatch.setattr(module, "encode_prompt", tokens)
+
+    def unchanged_tokens(tokens: list[int], tokenizer: object) -> list[int]:
+        return tokens
+
+    monkeypatch.setattr(module, "fix_unmatched_think_end_tokens", unchanged_tokens)
+
+    def denied(*args: object) -> bool:
+        return False
+
+    monkeypatch.setattr(result, "_admit_memory", denied)
     progress = Mock(return_value=[])
     errors = Mock()
     monkeypatch.setattr(result, "_advance", progress)
@@ -271,17 +304,28 @@ def test_unknown_model_all_idle_emits_visible_resource_error(
     result.model = cast(Model, Mock())
     result._queue.append(CHAT_TASK)
     result._all_tasks[CHAT_TASK.task_id] = CHAT_TASK
-    monkeypatch.setattr(
-        module.batch_generator, "apply_chat_template", lambda *_: "rendered"
-    )
-    monkeypatch.setattr(module, "encode_prompt", lambda *_: [1])
-    monkeypatch.setattr(
-        module, "fix_unmatched_think_end_tokens", lambda tokens, _: tokens
-    )
+
+    def rendered(*args: object) -> str:
+        return "rendered"
+
+    monkeypatch.setattr(module.batch_generator, "apply_chat_template", rendered)
+
+    def tokens(*args: object) -> list[int]:
+        return [1]
+
+    monkeypatch.setattr(module, "encode_prompt", tokens)
+
+    def unchanged_tokens(tokens: list[int], tokenizer: object) -> list[int]:
+        return tokens
+
+    monkeypatch.setattr(module, "fix_unmatched_think_end_tokens", unchanged_tokens)
     emitted = list(result.step())
     events = cast(Mock, result.event_sender.send).call_args_list
     assert len(events) == 1
-    chunk = events[0].args[0].chunk
+    event = cast(object, events[0].args[0])
+    assert isinstance(event, ChunkGenerated)
+    chunk = event.chunk
+    assert isinstance(chunk, ErrorChunk)
     assert chunk.finish_reason == "error"
     assert chunk.error_message == "cooperative_memory_admission_failed"
     assert not result._queue and len(emitted) == 1
@@ -307,19 +351,31 @@ def test_divergent_rank_ownership_is_same_fatal_boundary_not_local_retry(
     ranks = [engine(monkeypatch), engine(monkeypatch)]
     ranks[1]._slots[1]._active = active(CHAT_TASK)
     active_identity = ranks[1]._slots[1]._active
-    monkeypatch.setattr(
-        module.batch_generator, "apply_chat_template", lambda *_: "rendered"
-    )
-    monkeypatch.setattr(module, "encode_prompt", lambda *_: [1])
-    monkeypatch.setattr(
-        module, "fix_unmatched_think_end_tokens", lambda tokens, _: tokens
-    )
+
+    def rendered(*args: object) -> str:
+        return "rendered"
+
+    monkeypatch.setattr(module.batch_generator, "apply_chat_template", rendered)
+
+    def tokens(*args: object) -> list[int]:
+        return [1]
+
+    monkeypatch.setattr(module, "encode_prompt", tokens)
+
+    def unchanged_tokens(tokens: list[int], tokenizer: object) -> list[int]:
+        return tokens
+
+    monkeypatch.setattr(module, "fix_unmatched_think_end_tokens", unchanged_tokens)
     gathered = [[0, 3, 0, 65536, 0, 0, 0, 0, 0], [0, 1, 0, 65536, 0, 0, 0, 0, 0]]
-    failures = []
+    failures: list[str] = []
     for result in ranks:
         result._queue.append(CHAT_TASK)
         result._all_tasks[CHAT_TASK.task_id] = CHAT_TASK
-        monkeypatch.setattr(result, "_memory_rows", lambda *_: gathered)
+
+        def gathered_rows(*args: object) -> list[list[int]]:
+            return gathered
+
+        monkeypatch.setattr(result, "_memory_rows", gathered_rows)
         with pytest.raises(RuntimeError) as failure:
             list(result.step())
         failures.append(str(failure.value))
