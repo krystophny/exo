@@ -19,10 +19,12 @@ from mlx_lm.models.deepseek_v4 import (
 from mlx_lm.models.deepseek_v4 import (
     _CompressorBranch as CompressorBranch,  # type: ignore
 )
+from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.types.memory import Memory
 from exo.worker.engines.mlx.constants import CACHE_GROUP_SIZE, KV_CACHE_BITS
+from exo.worker.engines.mlx.mtp import mtp_enabled
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.runner.bootstrap import logger
 
@@ -399,7 +401,11 @@ class KVPrefixCache:
         if has_ssm:
             target = best_length
         else:
+            # MTP entry i also depends on token i+1. Leave that matched token
+            # outside both caches so a changed suffix cannot reuse a draft pair.
             desired = (max_length - 1) if is_exact else best_length
+            if mtp_enabled(model):
+                desired = min(desired, max(0, best_length - 1))
             target = min(cached_length, desired)
         restore_pos, restore_snap = self._get_snapshot(best_index, target)
 
@@ -608,6 +614,14 @@ def make_kv_cache(
     model: Model, max_kv_size: int | None = None, keep: int = 0
 ) -> KVCacheType:
     assert hasattr(model, "layers")
+
+    if mtp_enabled(model):
+        assert isinstance(model, DeepseekV32Model)
+        mtp_caches: list[CacheList] = []
+        for entry in [*model.make_cache(), model.make_mtp_cache()]:
+            assert isinstance(entry, CacheList)
+            mtp_caches.append(entry)
+        return mtp_caches
 
     if hasattr(model, "make_cache"):
         logger.info("Using MLX LM's make cache")

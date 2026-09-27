@@ -67,7 +67,7 @@ members = ["rust/exo_rs", "bench", "tools"]
 [tool.uv.sources]
 exo-rs = { workspace = true }
 mlx = { git = "https://github.com/krystophny/mlx-jaccl-fix-small-recv", rev = "1d4368eb7006be8104c11950ade3ae835fe65396" }
-mlx-lm = { git = "https://github.com/krystophny/mlx-lm", rev = "5cd9cf68c260e87438749afbb95bcb272198e690" }
+mlx-lm = { git = "https://github.com/krystophny/mlx-lm", rev = "2c03d14c64a5b135019faae10f0e774f1d627601" }
 mflux = { git = "https://github.com/evanev7/mflux", branch = "exo2" }
 [build-system]
 requires = ["uv_build>=0.8.9,<0.9.0"]

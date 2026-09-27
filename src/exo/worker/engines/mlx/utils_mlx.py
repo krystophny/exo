@@ -65,6 +65,7 @@ from exo.worker.engines.mlx.auto_parallel import (
     pipeline_auto_parallel,
     tensor_auto_parallel,
 )
+from exo.worker.engines.mlx.mtp import mtp_enabled, mtp_weights_path
 from exo.worker.engines.mlx.types import Model
 from exo.worker.runner.bootstrap import logger
 
@@ -179,7 +180,9 @@ def load_mlx_items(
             lazy=True,
             strict=native_glm,
             model_config={"model_file": None} if native_glm else {},
+            mtp_path=mtp_weights_path(),
         )
+        mtp_enabled(model)
         # Eval layers one by one for progress reporting
         try:
             inner = get_inner_model(model)
@@ -248,7 +251,12 @@ def shard_and_load(
         lazy=True,
         strict=native_glm,
         model_config={"model_file": None} if native_glm else {},
+        mtp_path=mtp_weights_path(),
     )
+    if mtp_enabled(model) and not isinstance(shard_metadata, TensorShardMetadata):
+        raise ValueError(
+            "Native MTP requires tensor parallelism for distributed inference"
+        )
     logger.debug(model)
     if hasattr(model, "model") and isinstance(model.model, DeepseekV3Model):  # type: ignore
         pass

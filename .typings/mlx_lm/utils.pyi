@@ -28,6 +28,8 @@ def load_model(
     get_model_classes: Callable[
         [dict[str, Any]], Tuple[Type[nn.Module], Type[ModelArgs]]
     ] = ...,
+    trust_remote_code: bool = False,
+    mtp_path: Path | None = None,
 ) -> Tuple[nn.Module, dict[str, Any]]:
     """
     Load and initialize the model from a given path.

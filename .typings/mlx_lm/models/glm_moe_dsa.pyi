@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from .base import BaseModelArgs
-from .deepseek_v32 import Model as DSV32Model
+from mlx_lm.models.deepseek_v32 import Model as DSV32Model
 
 @dataclass
 class ModelArgs(BaseModelArgs):

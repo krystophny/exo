@@ -15,11 +15,11 @@ from mlx_lm.models.base import (
     scaled_dot_product_attention,
 )
 from mlx_lm.models.cache import ArraysCache, KVCache
-from mlx_lm.models.deepseek_v3 import DeepseekV3MLP
+from mlx_lm.models.deepseek_v3 import DeepseekV3DecoderLayer, DeepseekV3MLP
 from mlx_lm.models.deepseek_v3 import Model as DeepseekV3Model
 from mlx_lm.models.deepseek_v4 import DeepseekV4MoE, V4Attention
 from mlx_lm.models.deepseek_v4 import Model as DeepseekV4Model
-from mlx_lm.models.deepseek_v32 import DeepseekV32MLP
+from mlx_lm.models.deepseek_v32 import DeepseekV32DecoderLayer, DeepseekV32MLP
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
 from mlx_lm.models.gemma4 import Model as Gemma4Model
 from mlx_lm.models.glm4_moe import Model as Glm4MoeModel
@@ -690,14 +690,19 @@ class DeepSeekShardingStrategy(TensorParallelShardingStrategy):
         self,
         model: nn.Module,
     ) -> Generator[ModelLoadingResponse, None, nn.Module]:
-        model = cast(DeepseekV3Model, model)
-        total = len(model.layers)
+        layers: list[DeepseekV3DecoderLayer | DeepseekV32DecoderLayer] = list(
+            cast(DeepseekV3Model, model).layers
+        )
+        if isinstance(model, DeepseekV32Model) and model.has_mtp:
+            layers.append(model.mtp.layer)
+        total = len(layers)
 
-        for i, layer in enumerate(model.layers):
+        for i, layer in enumerate(layers):
             mx.eval(layer.parameters())
 
             # Shard the self attention
             if layer.self_attn.q_lora_rank is None:
+                assert isinstance(layer, DeepseekV3DecoderLayer)
                 layer.self_attn.q_proj = self.all_to_sharded_linear(
                     layer.self_attn.q_proj
                 )

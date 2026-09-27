@@ -280,6 +280,9 @@ class CacheList(_BaseCache):
         In-place extend this cache with the other cache.
         """
 
+class MLACacheList(CacheList):
+    def to_quantized(self, group_size: int = 64, bits: int = 4) -> CacheList: ...
+
 class BatchKVCache(_BaseCache):
     step: int
     keys: array | None
