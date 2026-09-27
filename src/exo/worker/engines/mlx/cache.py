@@ -1,4 +1,5 @@
 import gc
+import hashlib
 import os
 from copy import deepcopy
 from typing import TYPE_CHECKING
@@ -337,6 +338,32 @@ class KVPrefixCache:
             return snap.token_count, snap
 
         return 0, None
+
+    def affinity_metadata_digest(self) -> int:
+        """Compact control-plane identity; never reads or copies KV arrays."""
+        metadata = [
+            (
+                len(prompt),
+                cache_length(self.caches[index]),
+                tuple(
+                    snapshot.token_count for snapshot in (self._snapshots[index] or [])
+                ),
+            )
+            for index, prompt in enumerate(self.prompts)
+        ]
+        return int.from_bytes(
+            hashlib.sha256(repr(metadata).encode()).digest()[:4], "little", signed=True
+        )
+
+    def prefix_match_length(self, prompt_tokens: mx.array) -> int:
+        """Read-only score for choosing an idle native cache owner."""
+        best = 0
+        for index, prompt in enumerate(self.prompts):
+            if self._single_session and self._generated_tokens:
+                prompt = mx.concatenate([prompt, mx.array(self._generated_tokens)])
+            length = get_prefix_length(prompt_tokens, prompt)
+            best = max(best, min(length, cache_length(self.caches[index])))
+        return best
 
     def get_kv_cache(
         self,

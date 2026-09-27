@@ -290,6 +290,7 @@ def prefill(
     group: mx.distributed.Group | None,
     on_prefill_progress: Callable[[int, int], None] | None,
     distributed_prompt_progress_callback: Callable[[], None] | None,
+    prefill_step_size_override: int | None = None,
 ) -> tuple[float, int, list[CacheSnapshot]]:
     """Prefill the KV cache with prompt tokens.
 
@@ -333,7 +334,7 @@ def prefill(
 
     is_pipeline = _has_pipeline_communication_layer(model)
 
-    prefill_step_size = int(os.getenv("EXO_PREFILL_STEP_SIZE", "4096"))
+    prefill_step_size = prefill_step_size_override or int(os.getenv("EXO_PREFILL_STEP_SIZE", "4096"))
 
     try:
         if is_pipeline and num_tokens >= prefill_step_size:
@@ -542,6 +543,7 @@ def mlx_generate(
     distributed_prompt_progress_callback: Callable[[], None] | None = None,
     on_generation_token: Callable[[], None] | None = None,
     vision_processor: VisionProcessor | None = None,
+    prefill_step_size_override: int | None = None,
 ) -> Generator[GenerationResponse]:
     # Ensure that generation stats only contains peak memory for this generation
     mx.reset_peak_memory()
@@ -630,6 +632,17 @@ def mlx_generate(
         top_k=task.top_k if task.top_k is not None else 0,
     )
 
+    if os.getenv("EXO_COOPERATIVE_SLOTS") == "2":
+        from exo.worker.engines.mlx.session_sampling import make_session_sampler
+
+        sampler = make_session_sampler(
+            seed,
+            task.temperature if task.temperature is not None else 0.7,
+            task.top_p if task.top_p is not None else 1.0,
+            task.min_p if task.min_p is not None else 0.05,
+            task.top_k if task.top_k is not None else 0,
+        )
+
     # Normalize stop sequences to a list
     stop_sequences: list[str] = (
         ([task.stop] if isinstance(task.stop, str) else task.stop)
@@ -685,6 +698,7 @@ def mlx_generate(
                 group,
                 on_prefill_progress,
                 distributed_prompt_progress_callback,
+                prefill_step_size_override,
             )
     cache_snapshots: list[CacheSnapshot] | None = ssm_snapshots_list or None
 
@@ -737,13 +751,17 @@ def mlx_generate(
             distributed_prompt_progress_callback()
 
     mtp_options: dict[str, object] = {}
+    if os.getenv("EXO_COOPERATIVE_SLOTS") == "2":
+        mtp_options["manage_wired_limit"] = False
     if use_mtp:
-        mtp_options = {
-            "mtp": True,
-            "mtp_num_draft_tokens": int(os.getenv("EXO_MTP_DRAFT_TOKENS", "1")),
-            "logits_processor_tokens": all_prompt_tokens,
-            "prompt_progress_callback": mtp_progress,
-        }
+        mtp_options.update(
+            {
+                "mtp": True,
+                "mtp_num_draft_tokens": int(os.getenv("EXO_MTP_DRAFT_TOKENS", "1")),
+                "logits_processor_tokens": all_prompt_tokens,
+                "prompt_progress_callback": mtp_progress,
+            }
+        )
     responses = stream_generate(
         model=model,
         draft_model=None,
@@ -753,7 +771,7 @@ def mlx_generate(
         sampler=sampler,
         logits_processors=logits_processors,
         prompt_cache=caches,
-        prefill_step_size=int(os.getenv("EXO_PREFILL_STEP_SIZE", "256"))
+        prefill_step_size=(prefill_step_size_override or int(os.getenv("EXO_PREFILL_STEP_SIZE", "256")))
         if use_mtp
         else 1,
         kv_group_size=KV_GROUP_SIZE,

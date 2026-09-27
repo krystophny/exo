@@ -3,7 +3,7 @@ import time
 from collections import deque
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 
 import mlx.core as mx
 from mlx_lm.tokenizer_utils import TokenizerWrapper
@@ -103,6 +103,9 @@ class SequentialGenerator(Engine):
     vision_processor: VisionProcessor | None = None
     check_for_cancel_every: int = 50
 
+    on_cooperative_prefill_progress: Callable[[], None] | None = None
+    prefill_step_size_override: int | None = None
+
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)
     _maybe_queue: list[TextGeneration] = field(default_factory=list, init=False)
     _maybe_cancel: list[TextGeneration] = field(default_factory=list, init=False)
@@ -191,8 +194,14 @@ class SequentialGenerator(Engine):
             while (parsed := next(output_generator, None)) is not None:
                 output.append((task.task_id, parsed))
 
-        except (StopIteration, PrefillCancelled):
+        except StopIteration:
             output.append((task.task_id, FinishedResponse()))
+            self._active = None
+            if self._queue:
+                self._start_next()
+
+        except PrefillCancelled:
+            output.append((task.task_id, CancelledResponse()))
             self._active = None
             if self._queue:
                 self._start_next()
@@ -273,6 +282,8 @@ class SequentialGenerator(Engine):
                 raise PrefillCancelled()
 
             self.agree_on_tasks()
+            if self.on_cooperative_prefill_progress is not None:
+                self.on_cooperative_prefill_progress()
 
         tokens_since_cancel_check = self.check_for_cancel_every
 
@@ -298,6 +309,7 @@ class SequentialGenerator(Engine):
             on_generation_token=on_generation_token,
             group=self.group,
             vision_processor=self.vision_processor,
+            prefill_step_size_override=self.prefill_step_size_override,
         )
 
     def close(self) -> None:

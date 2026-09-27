@@ -11,6 +11,7 @@ from exo.shared.types.events import Event
 from exo.shared.types.tasks import TaskId
 from exo.shared.types.worker.instances import BoundInstance
 from exo.shared.types.worker.runner_response import ModelLoadingResponse
+from exo.shared.types.worker.shards import TensorShardMetadata
 from exo.utils.channels import MpReceiver, MpSender
 from exo.worker.engines.base import Builder, Engine
 from exo.worker.runner.bootstrap import logger
@@ -40,6 +41,12 @@ class MlxBuilder(Builder):
     vision_processor: VisionProcessor | None = None
 
     def connect(self, bound_instance: BoundInstance) -> None:
+        if os.getenv("EXO_COOPERATIVE_SLOTS") == "2" and not isinstance(
+            bound_instance.bound_shard, TensorShardMetadata
+        ):
+            raise ValueError(
+                "Cooperative native slots require tensor-parallel placement"
+            )
         self.group = initialize_mlx(bound_instance)
 
     def load(self, bound_instance: BoundInstance) -> Generator[ModelLoadingResponse]:
@@ -87,6 +94,32 @@ class MlxBuilder(Builder):
         kv_prefix_cache = KVPrefixCache(self.group)
 
         device_rank = 0 if self.group is None else self.group.rank()
+        if os.getenv("EXO_COOPERATIVE_SLOTS") == "2":
+            if self.vision_processor is not None:
+                raise ValueError("Cooperative GLM slots are text-only")
+            if (
+                os.getenv("EXO_NO_BATCH") != "1"
+                or os.getenv("EXO_PREFIX_CACHE_SINGLE_SESSION") != "1"
+            ):
+                raise ValueError(
+                    "Cooperative slots require independent native single-session owners"
+                )
+            from exo.worker.runner.llm_inference.cooperative_generator import (
+                CooperativeGenerator,
+            )
+
+            return CooperativeGenerator(
+                model=self.inference_model,
+                tokenizer=self.tokenizer,
+                group=self.group,
+                tool_parser=tool_parser,
+                kv_prefix_cache=kv_prefix_cache,
+                model_id=self.model_id,
+                device_rank=device_rank,
+                cancel_receiver=self.cancel_receiver,
+                event_sender=self.event_sender,
+                vision_processor=None,
+            )
         if os.environ.get("EXO_NO_BATCH"):
             logger.info("using SequentialGenerator (batching disabled)")
             return SequentialGenerator(
