@@ -6,7 +6,9 @@ from typing import Any
 
 from exo.shared.types.worker.runner_response import GenerationResponse, ToolCallResponse
 from exo.worker.runner.llm_inference.model_output_parsers import parse_tool_calls
-from exo.worker.runner.llm_inference.tool_parsers import make_mlx_parser
+from exo.worker.runner.llm_inference.tool_parsers import (
+    make_mlx_parser,
+)
 
 
 def _make_responses(texts: list[str]) -> Generator[GenerationResponse]:
@@ -45,6 +47,77 @@ class TestParseToolCalls:
         assert len(results) == 1
         assert isinstance(results[0], ToolCallResponse)
 
+    def test_split_tool_call_marker_is_buffered(self):
+        texts = ["before ", "<too", "l_call>", "test_fn", "</tool", "_call>"]
+        results = list(
+            parse_tool_calls(
+                _make_responses(texts),
+                _dummy_parser,
+                tools=None,
+            )
+        )
+
+        assert len(results) == 2
+        assert isinstance(results[0], GenerationResponse)
+        assert results[0].text == "before "
+        assert isinstance(results[1], ToolCallResponse)
+
+    def test_tool_call_after_text_in_same_chunk_is_parsed(self):
+        texts = ["before <tool_call>test_fn</tool_call>"]
+        results = list(
+            parse_tool_calls(
+                _make_responses(texts),
+                _dummy_parser,
+                tools=None,
+            )
+        )
+
+        assert len(results) == 2
+        assert isinstance(results[0], GenerationResponse)
+        assert results[0].text == "before "
+        assert isinstance(results[1], ToolCallResponse)
+
+    def test_nested_control_markup_in_tool_argument_fails_closed(self):
+        def _nested_parser(_text: str) -> dict[str, Any]:
+            return {
+                "name": "bash",
+                "arguments": {
+                    "command": "python3 -c '</think><tool_call>bash'",
+                },
+            }
+
+        results = list(
+            parse_tool_calls(
+                _make_responses(["<tool_call>", "bash", "</tool_call>"]),
+                make_mlx_parser("<tool_call>", "</tool_call>", _nested_parser),
+                tools=None,
+            )
+        )
+
+        assert len(results) == 1
+        assert isinstance(results[0], GenerationResponse)
+        assert results[0].finish_reason == "stop"
+
+    def test_malformed_tool_call_schema_stops_without_error(self):
+        text = (
+            "<tool_call>bash"
+            "<arg_key>command</arg_key>"
+            "<arg_value>cat /tmp/log | tail -40</arg_value>"
+            "<arg_key>description concatenated command</arg_value>"
+        )
+        results = list(
+            parse_tool_calls(
+                _make_responses([text]),
+                _dummy_parser,
+                tools=None,
+            )
+        )
+
+        assert len(results) == 1
+        assert isinstance(results[0], GenerationResponse)
+        assert results[0].text == text
+        assert results[0].finish_reason == "stop"
+
     def test_no_tool_call_passes_through(self):
         """Responses without tool calls should pass through unchanged."""
         texts = ["Hello", " world"]
@@ -67,7 +140,7 @@ class TestParseToolCalls:
         assert r1.finish_reason == "stop"
 
     def test_failed_parse_yields_text(self):
-        """When tool call parsing fails, the text should be yielded as-is."""
+        """When tool call parsing fails, the text should stop normally."""
 
         def _failing_parser(text: str) -> dict[str, Any]:
             raise ValueError("parse failed")
@@ -84,7 +157,7 @@ class TestParseToolCalls:
         assert len(results) == 1
         assert isinstance(results[0], GenerationResponse)
         assert results[0].text == "<tool_call>bad content</tool_call>"
-        assert results[0].finish_reason == "error"
+        assert results[0].finish_reason == "stop"
 
     def test_tool_schema_coerces_string_arguments_to_expected_types(self):
         """Tool argument values should be coerced using provided JSON schema."""
@@ -176,3 +249,46 @@ class TestParseToolCalls:
 
         args = json.loads(results[0].tool_calls[0].arguments)  # pyright: ignore[reportAny]
         assert args == {"action": "output", "id": "0"}
+
+
+def _markup_leak_parser(_text: str) -> dict[str, Any]:
+    """Mimics a format parser that leaked protocol markup into the call."""
+    return {
+        "name": "doc_read_page",
+        "arguments": {"file<arg_key": "page</arg_key><arg_value>5"},
+    }
+
+
+class TestResidualMarkupGuard:
+    """A call whose name/arguments still carry tool-call markup is dropped."""
+
+    def test_call_with_residual_markup_is_dropped(self):
+        results = list(
+            parse_tool_calls(
+                _make_responses(["<tool_call>", "junk", "</tool_call>"]),
+                make_mlx_parser("<tool_call>", "</tool_call>", _markup_leak_parser),
+                tools=None,
+            )
+        )
+
+        assert len(results) == 1
+        # Dropped rather than dispatched: yielded as text, not a ToolCallResponse.
+        assert isinstance(results[0], GenerationResponse)
+        assert results[0].text == "<tool_call>junk</tool_call>"
+
+    def test_html_argument_is_preserved(self):
+        def parse_html(_text: str) -> dict[str, Any]:
+            return {"name": "web_fetch", "arguments": {"snippet": "<div>x</div>"}}
+
+        results = list(
+            parse_tool_calls(
+                _make_responses(["<tool_call>", "payload", "</tool_call>"]),
+                make_mlx_parser("<tool_call>", "</tool_call>", parse_html),
+                tools=None,
+            )
+        )
+        assert len(results) == 1
+        assert isinstance(results[0], ToolCallResponse)
+        assert json.loads(results[0].tool_calls[0].arguments) == {
+            "snippet": "<div>x</div>"
+        }
