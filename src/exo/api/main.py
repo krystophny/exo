@@ -47,6 +47,7 @@ from exo.api.adapters.responses import (
     responses_request_to_text_generation,
 )
 from exo.api.keepalive import with_sse_keepalive
+from exo.api.private_auth import install_private_auth
 from exo.api.types import (
     AddCustomModelParams,
     AdvancedImageParams,
@@ -263,6 +264,7 @@ class API:
         self.paused_ev: anyio.Event = anyio.Event()
 
         self.app = FastAPI()
+        install_private_auth(self.app)
 
         @self.app.middleware("http")
         async def _log_requests(
