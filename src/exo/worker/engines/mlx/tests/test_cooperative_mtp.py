@@ -2,6 +2,7 @@
 
 import gc
 import weakref
+from typing import cast
 
 import mlx.core as mx
 import pytest
@@ -16,9 +17,14 @@ from exo.shared.types.text_generation import (
     TextGenerationTaskParams,
 )
 from exo.utils.channels import MpReceiver, MpSender
-from exo.worker.engines.mlx.cache import KVPrefixCache, cache_length
+from exo.worker.engines.mlx.cache import (
+    KVPrefixCache,
+    cache_length,
+    encode_prompt,
+)
 from exo.worker.engines.mlx.generator.generate import mlx_generate
 from exo.worker.engines.mlx.tests.test_mtp import tiny_model
+from exo.worker.engines.mlx.utils_mlx import fix_unmatched_think_end_tokens
 
 
 @pytest.mark.parametrize("all_accept", [False, True])
@@ -431,3 +437,215 @@ def test_interleaved_streams_preserve_caller_wired_limit() -> None:
         first.close()
         second.close()
         mx.set_wired_limit(previous)
+
+
+def test_owner_turn_survives_interleaved_computor_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Three cooperative slots, one active generation at a time (as a real
+    Slopgate deployment would run it): owner turn 1, then an interleaved
+    computor request, then owner turn 2. Turn 2 must reuse the owner's own
+    cached prefix (observable via the emitted cached_tokens usage stat and
+    directly via prefix_match_length), and both requests' outputs must match
+    standalone oracle runs of the same model.
+    """
+    from exo.shared.types.chunks import TokenChunk
+    from exo.shared.types.common import CommandId
+    from exo.shared.types.tasks import TextGeneration
+    from exo.shared.types.worker.instances import InstanceId
+    from exo.shared.types.worker.runner_response import FinishedResponse
+    from exo.worker.runner.llm_inference.cooperative_generator import (
+        CooperativeGenerator,
+        _OwnerPrefixCache,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    for key, value in {
+        "EXO_COOPERATIVE_SLOTS": "3",
+        "EXO_COOPERATIVE_ACTIVE": "1",
+        "EXO_MTP": "1",
+        "EXO_MTP_DRAFT_TOKENS": "1",
+        "EXO_NO_BATCH": "1",
+        "EXO_PREFIX_CACHE_SINGLE_SESSION": "1",
+        "EXO_PREFILL_STEP_SIZE": "4",
+        "EXO_INTERLEAVED_PREFILL_STEP_SIZE": "4",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr("exo.worker.engines.mlx.generator.generate.KV_BITS", 8)
+    monkeypatch.setattr("exo.worker.engines.mlx.generator.generate.KV_GROUP_SIZE", 64)
+
+    def render(_tokenizer: TokenizerWrapper, task: TextGenerationTaskParams) -> str:
+        return task.instructions or ""
+
+    monkeypatch.setattr(
+        "exo.worker.runner.llm_inference.batch_generator.apply_chat_template", render
+    )
+    model, tokenizer = tiny_model(True)
+
+    def oracle(prompt: str) -> list[int]:
+        tokens = tokenizer.encode(prompt, add_special_tokens=False)
+        result: list[int] = []
+        for token, _ in generate_step(
+            mx.array(tokens),
+            model,
+            max_tokens=8,
+            kv_bits=8,
+            quantized_kv_start=0,
+            prefill_step_size=4,
+        ):
+            result.append(int(token))
+            if int(token) in (tokenizer.eos_token_ids or []):
+                break
+        return result
+
+    class Receiver(MpReceiver[TaskId]):
+        def __init__(self) -> None:
+            self.pending: list[TaskId] = []
+
+        def collect(self) -> list[TaskId]:
+            result, self.pending = self.pending, []
+            return result
+
+    class Sender(MpSender[Event]):
+        def __init__(self) -> None:
+            self.events: list[ChunkGenerated] = []
+
+        def send(self, item: Event) -> None:
+            assert isinstance(item, ChunkGenerated)
+            self.events.append(item)
+
+    engine = CooperativeGenerator(
+        model=model,
+        tokenizer=tokenizer,
+        group=None,
+        tool_parser=None,
+        kv_prefix_cache=KVPrefixCache(None),
+        model_id=ModelId("test/glm"),
+        device_rank=0,
+        cancel_receiver=Receiver(),
+        event_sender=Sender(),
+        num_slots=3,
+    )
+
+    def _count_busy_slots(coop: CooperativeGenerator) -> int:
+        slots = coop._slots  # pyright: ignore[reportPrivateUsage]
+        return sum(
+            1
+            for slot in slots
+            if slot._active is not None  # pyright: ignore[reportPrivateUsage]
+            or slot._queue  # pyright: ignore[reportPrivateUsage]
+        )
+
+    def run_to_completion(task: TextGeneration) -> list[TokenChunk]:
+        chunks: list[TokenChunk] = []
+        for _ in range(200):
+            outputs = list(engine.step())
+            busy = _count_busy_slots(engine)
+            assert busy <= 1, "EXO_COOPERATIVE_ACTIVE=1 must never admit a 2nd slot"
+            chunks.extend(
+                chunk
+                for tid, chunk in outputs
+                if tid == task.task_id and isinstance(chunk, TokenChunk)
+            )
+            if any(
+                tid == task.task_id and isinstance(chunk, FinishedResponse)
+                for tid, chunk in outputs
+            ):
+                break
+        return chunks
+
+    owner_key = "owner-session-1"
+    owner_prompt_1 = "1 2 3 4 5 6"
+    owner_turn1 = TextGeneration(
+        instance_id=InstanceId(),
+        command_id=CommandId(),
+        task_params=TextGenerationTaskParams(
+            model=ModelId("test/glm"),
+            input=[],
+            instructions=InputMessageContent(owner_prompt_1),
+            bench=True,
+            use_prefix_cache=True,
+            temperature=0,
+            max_output_tokens=8,
+            session_class="owner",
+            session_key=owner_key,
+        ),
+    )
+    engine.submit(owner_turn1)
+    owner1_chunks = run_to_completion(owner_turn1)
+    assert [c.token_id for c in owner1_chunks] == oracle(owner_prompt_1)
+    assert (
+        engine._slot_last_key[0]  # pyright: ignore[reportPrivateUsage]
+        == owner_key
+    )  # owner turn 1 landed on slot 0
+
+    owner_prefix = cast(
+        _OwnerPrefixCache,
+        engine._slots[0].kv_prefix_cache,  # pyright: ignore[reportPrivateUsage]
+    )
+    owner1_tokens = fix_unmatched_think_end_tokens(
+        encode_prompt(tokenizer, owner_prompt_1), tokenizer
+    )
+
+    computor_prompt = " ".join(str(i % 50) for i in range(60))
+    computor_task = TextGeneration(
+        instance_id=InstanceId(),
+        command_id=CommandId(),
+        task_params=TextGenerationTaskParams(
+            model=ModelId("test/glm"),
+            input=[],
+            instructions=InputMessageContent(computor_prompt),
+            bench=True,
+            use_prefix_cache=True,
+            temperature=0,
+            max_output_tokens=8,
+            session_class="computor",
+        ),
+    )
+    engine.submit(computor_task)
+    computor_chunks = run_to_completion(computor_task)
+    assert [c.token_id for c in computor_chunks] == oracle(computor_prompt)
+    # The computor request must never have touched the owner's slot: its
+    # cached prefix for turn 1's prompt is still fully intact.
+    assert owner_prefix.prefix_match_length(owner1_tokens) == len(owner1_tokens)
+    # computor never records a key
+    assert engine._slot_last_key[2] is None  # pyright: ignore[reportPrivateUsage]
+
+    owner_prompt_2 = f"{owner_prompt_1} 7 8 9"
+    owner2_tokens = fix_unmatched_think_end_tokens(
+        encode_prompt(tokenizer, owner_prompt_2), tokenizer
+    )
+    # Cache-hit oracle: before turn 2 is even admitted, the owner's own slot
+    # already matches the whole of turn 1's prompt as a strict prefix.
+    assert owner_prefix.prefix_match_length(owner2_tokens) == len(owner1_tokens)
+
+    owner_turn2 = TextGeneration(
+        instance_id=InstanceId(),
+        command_id=CommandId(),
+        task_params=TextGenerationTaskParams(
+            model=ModelId("test/glm"),
+            input=[],
+            instructions=InputMessageContent(owner_prompt_2),
+            bench=True,
+            use_prefix_cache=True,
+            temperature=0,
+            max_output_tokens=8,
+            session_class="owner",
+            session_key=owner_key,
+        ),
+    )
+    engine.submit(owner_turn2)
+    owner2_chunks = run_to_completion(owner_turn2)
+    assert [c.token_id for c in owner2_chunks] == oracle(owner_prompt_2)
+    # turn 2 stayed on its own slot
+    turn2_key = engine._slot_last_key[0]  # pyright: ignore[reportPrivateUsage]
+    assert turn2_key == owner_key
+    # The prefill actually reused the cached prefix (observable cache hit):
+    # the engine trims the last matched token to keep decode state exact,
+    # so the reported cache hit is turn 1's length minus a small margin.
+    assert any(
+        chunk.usage is not None
+        and chunk.usage.prompt_tokens_details is not None
+        and chunk.usage.prompt_tokens_details.cached_tokens
+        >= len(owner1_tokens) - 2
+        for chunk in owner2_chunks
+    )

@@ -581,3 +581,107 @@ def test_default_two_slots_have_no_active_limit_and_full_eligibility(
     assert result._active_limit == 0
     assert result._min_match == 1024
     assert result._eligible_indices(None) == [0, 1]
+
+
+def test_new_session_with_shared_system_prompt_never_steals_owner_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two OpenCode/Pi-style sessions share a near-identical, >2000-token
+    system prompt. Session A already owns slot 0. Session B's first request
+    scores well above MIN_MATCH against slot 0's cache purely from the
+    shared prompt, but must never be routed there -- it belongs on the
+    empty slot instead. Session A's own next turn must still land back on
+    its own slot even when the (by-then warm) other slot scores as well.
+    """
+    monkeypatch.setenv("EXO_COOPERATIVE_MIN_MATCH", "1024")
+    result = engine(monkeypatch, num_slots=2)
+    slot_a, slot_b = result._slots
+    result._slot_last_key[0] = "session-a"
+    cast(_OwnerPrefixCache, slot_a.kv_prefix_cache).caches.append(cached())
+
+    chosen_b = result._choose_slot(
+        [slot_a, slot_b], scores=[2000, 0], session_key="session-b"
+    )
+    assert chosen_b == 1  # the empty slot, never session A's warm cache
+
+    result._slot_last_key[1] = "session-b"
+    chosen_a_turn2 = result._choose_slot(
+        [slot_a, slot_b], scores=[4096, 4096], session_key="session-a"
+    )
+    assert chosen_a_turn2 == 0  # A's own slot, despite the tied score
+
+
+def test_session_continuation_ignores_higher_score_elsewhere(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = engine(monkeypatch, num_slots=2)
+    slot_a, slot_b = result._slots
+    result._slot_last_key[0] = "session-a"
+    result._slot_last_key[1] = "session-b"
+    chosen = result._choose_slot(
+        [slot_a, slot_b], scores=[100, 99999], session_key="session-a"
+    )
+    assert chosen == 0
+
+
+def test_third_session_evicts_lru_owner_slot_never_computor_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = engine(monkeypatch, num_slots=3)
+    slot_a, slot_b, slot_computor = result._slots
+    result._slot_last_key[0] = "session-a"
+    result._slot_last_key[1] = "session-b"
+    result._last_finished = [10, 3, -1]  # session-b's slot is the LRU owner slot
+
+    eligible_indices = result._eligible_indices("owner")
+    assert eligible_indices == [0, 1]  # the computor lane is never a candidate
+    idle_eligible = [slot_a, slot_b]
+
+    chosen = result._choose_slot(idle_eligible, scores=[0, 0], session_key="session-c")
+    assert chosen == 1  # session-b's slot: least-recently-finished of the two
+    assert slot_computor not in idle_eligible
+
+
+def test_no_session_key_keeps_prefix_score_rule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EXO_COOPERATIVE_MIN_MATCH", "1024")
+    result = engine(monkeypatch, num_slots=2)
+    slot0, slot1 = result._slots
+    result._slot_last_key[0] = "session-a"
+    result._slot_last_key[1] = "session-b"
+    chosen = result._choose_slot([slot0, slot1], scores=[500, 2000], session_key=None)
+    assert chosen == 1  # legacy/no-header traffic still just follows the score
+
+
+def test_slot_last_key_only_recorded_on_successful_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = engine(monkeypatch, num_slots=2)
+    task = CHAT_TASK.model_copy(
+        update={"task_params": CHAT_PARAMS.model_copy(update={"session_key": "s1"})}
+    )
+    result._queue.append(task)
+    result._all_tasks[task.task_id] = task
+
+    def rendered(*args: object) -> str:
+        return "r"
+
+    monkeypatch.setattr(module.batch_generator, "apply_chat_template", rendered)
+
+    def tokens(*args: object) -> list[int]:
+        return [1]
+
+    monkeypatch.setattr(module, "encode_prompt", tokens)
+
+    def unchanged_tokens(tokens: list[int], tokenizer: object) -> list[int]:
+        return tokens
+
+    monkeypatch.setattr(module, "fix_unmatched_think_end_tokens", unchanged_tokens)
+
+    def denied(*args: object) -> bool:
+        return False
+
+    monkeypatch.setattr(result, "_admit_memory", denied)
+    list(result.step())
+    assert result._slot_last_key == [None, None]

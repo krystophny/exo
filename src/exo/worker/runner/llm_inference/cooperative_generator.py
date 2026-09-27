@@ -6,6 +6,7 @@ model residency. All ranks advance slots in the same agreed task order.
 
 import os
 import time
+import zlib
 from collections import deque
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -66,6 +67,18 @@ def _parse_min_match() -> int:
             f"EXO_COOPERATIVE_MIN_MATCH must be an integer >= 0, got {raw!r}"
         )
     return value
+
+
+def _key_hash(session_key: str | None) -> int:
+    """Stable (non-salted) hash of a session_key for the TP all_gather.
+
+    Python's builtin hash() is randomized per process, so it cannot be
+    compared across ranks. zlib.crc32 is deterministic and small enough
+    to pack into the int64 gather row alongside scores/digests.
+    """
+    if session_key is None:
+        return 0
+    return zlib.crc32(session_key.encode()) & 0x7FFFFFFF
 
 
 class _CacheMembers(Protocol):
@@ -457,23 +470,48 @@ class CooperativeGenerator(SequentialGenerator):
         session_key: str | None,
     ) -> int:
         indices = [self._slots.index(slot) for slot in idle_eligible]
+
+        def empty_of(candidates: list[int]) -> list[int]:
+            result: list[int] = []
+            for index in candidates:
+                cache = self._slots[index].kv_prefix_cache
+                if cache is not None and len(cache.caches) == 0:
+                    result.append(index)
+            return result
+
         if session_key is not None:
-            keyed = [
-                index
-                for index in indices
-                if self._slot_last_key[index] == session_key
-                and scores[index] >= self._min_match
+            # Rule 1: a slot this session already owns is always the
+            # continuation, regardless of prefix score. A stale or diverged
+            # score would only mean an extra re-prefill, never wrong output,
+            # and a coding agent's near-identical system prompt must never
+            # be allowed to outscore the session's own cache.
+            own = [
+                index for index in indices if self._slot_last_key[index] == session_key
             ]
-            if keyed:
-                return max(keyed, key=lambda index: scores[index])
+            if own:
+                return own[0]
+            # Rule 2: never steal a slot owned by a *different* session
+            # while an unclaimed (empty, or never keyed) eligible slot is
+            # available. Prefer an empty slot, else the least-recently-
+            # finished unclaimed slot, which then becomes this session's.
+            unclaimed = [
+                index for index in indices if self._slot_last_key[index] is None
+            ]
+            empty = empty_of(unclaimed)
+            if empty:
+                return empty[0]
+            if unclaimed:
+                return min(unclaimed, key=lambda index: self._last_finished[index])
+            # Every eligible idle slot belongs to some other session: evict
+            # the least-recently-finished one.
+            return min(indices, key=lambda index: self._last_finished[index])
+        # Rule 3: no session key (legacy/no header) keeps the prefix-score
+        # rule: a real prefix match wins, else prefer an empty slot, else
+        # the least-recently-finished one.
         matched = [index for index in indices if scores[index] >= self._min_match]
         if matched:
             return max(matched, key=lambda index: scores[index])
-        empty: list[int] = []
-        for index in indices:
-            cache = self._slots[index].kv_prefix_cache
-            if cache is not None and len(cache.caches) == 0:
-                empty.append(index)
+        empty = empty_of(indices)
         if empty:
             return empty[0]
         return min(indices, key=lambda index: self._last_finished[index])
@@ -561,13 +599,22 @@ class CooperativeGenerator(SequentialGenerator):
                     self._last_finished[index] if candidate in idle_eligible else 0
                     for index, candidate in enumerate(self._slots)
                 ]
+                # A stable hash of each slot's owning session_key, so a rank
+                # divergence in slot ownership (which would otherwise make
+                # ranks pick different owners for the same task) is caught
+                # the same way a divergent cache digest is.
+                key_hashes = [
+                    _key_hash(self._slot_last_key[index]) if candidate in idle_eligible else 0
+                    for index, candidate in enumerate(self._slots)
+                ]
                 gathered = mx.distributed.all_gather(
-                    mx.array(scores + metadata + finish_counters), group=self.group
+                    mx.array(scores + metadata + finish_counters + key_hashes),
+                    group=self.group,
                 )
                 rows = cast(
                     list[list[int]],
                     gathered.reshape(
-                        self.group.size(), len(scores) * 3, stream=mx.Device(mx.cpu)
+                        self.group.size(), len(scores) * 4, stream=mx.Device(mx.cpu)
                     ).tolist(),
                 )
                 if any(row != rows[0] for row in rows[1:]):
