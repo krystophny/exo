@@ -80,6 +80,10 @@ class MlxBuilder(Builder):
                 self.tokenizer.tool_parser,  # type: ignore
             )
 
+        if os.getenv("EXO_PREFIX_CACHE_SINGLE_SESSION") == "1" and not os.getenv(
+            "EXO_NO_BATCH"
+        ):
+            raise ValueError("Single-session prefix ownership requires EXO_NO_BATCH=1")
         kv_prefix_cache = KVPrefixCache(self.group)
 
         device_rank = 0 if self.group is None else self.group.rank()

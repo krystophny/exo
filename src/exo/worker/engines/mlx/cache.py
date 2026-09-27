@@ -133,7 +133,7 @@ def _copy_cache_list(cl: CacheList) -> CacheList:
             copied.append(_copy_arrays_cache(inner))
         else:
             copied.append(deepcopy(inner))
-    return CacheList(*copied)
+    return type(cl)(*copied)
 
 
 def _detached_copy_or_none(a: mx.array | None) -> mx.array | None:
@@ -247,6 +247,8 @@ def has_non_kv_caches(cache: KVCacheType) -> bool:
 
 class KVPrefixCache:
     def __init__(self, group: mx.distributed.Group | None):
+        self._single_session = os.getenv("EXO_PREFIX_CACHE_SINGLE_SESSION") == "1"
+        self._generated_tokens: list[int] = []
         self.prompts: list[mx.array] = []  # mx array of tokens (ints)
         self.caches: list[KVCacheType] = []
         self._snapshots: list[list[CacheSnapshot] | None] = []
@@ -258,12 +260,17 @@ class KVPrefixCache:
 
     def clear(self):
         """Clear all cached prompts and caches."""
+        self._generated_tokens.clear()
         self.prompts.clear()
         self.caches.clear()
         self._snapshots.clear()
         self._media_regions.clear()
         self._last_used.clear()
         self.prefill_tps.clear()
+
+    def record_generated_token(self, token: int) -> None:
+        if self._single_session and self.caches:
+            self._generated_tokens.append(token)
 
     def add_kv_cache(
         self,
@@ -274,9 +281,11 @@ class KVPrefixCache:
         prefill_tps: float = 0.0,
     ):
         """Add a new cache entry. Evicts LRU entries if memory is high."""
+        if self._single_session:
+            self.clear()
         self._evict_if_needed()
         self.prompts.append(prompt_tokens)
-        self.caches.append(deepcopy(cache))
+        self.caches.append(cache if self._single_session else deepcopy(cache))
         self._snapshots.append(ssm_snapshots)
         self._media_regions.append(media_regions or [])
         self.prefill_tps.append(prefill_tps)
@@ -359,6 +368,10 @@ class KVPrefixCache:
 
         # Find best cache match
         for i, cached_prompt in enumerate(self.prompts):
+            if self._single_session and self._generated_tokens:
+                cached_prompt = mx.concatenate(
+                    [cached_prompt, mx.array(self._generated_tokens)]
+                )
             length = get_prefix_length(prompt_tokens, cached_prompt)
             if length > 0:
                 length = self._validate_media_match(
@@ -374,6 +387,8 @@ class KVPrefixCache:
                 best_index, best_length = i, length
 
         if best_index is None:
+            if self._single_session:
+                self.clear()
             return make_kv_cache(model), prompt_tokens, None, False
 
         # For exact match: trim to max_length-1 so remaining has the last token
@@ -392,22 +407,30 @@ class KVPrefixCache:
         if restore_snap is None and has_ssm:
             return make_kv_cache(model), prompt_tokens, None, False
 
-        prompt_cache = deepcopy(self.caches[best_index])
+        prompt_cache = (
+            self.caches[best_index]
+            if self._single_session
+            else deepcopy(self.caches[best_index])
+        )
         tokens_to_trim = cached_length - restore_pos
         if tokens_to_trim > 0:
             trim_cache(prompt_cache, tokens_to_trim, restore_snap)
             # Reset cache offset to match trimmed length
             for c in prompt_cache:
-                if isinstance(c, (ArraysCache, RotatingKVCache)):
+                if isinstance(c, (ArraysCache, RotatingKVCache, CacheList)):
                     continue
                 if isinstance(c, DeepseekV4Cache):
                     continue
                 if hasattr(c, "offset"):
                     c.offset = restore_pos
 
+        remaining = prompt_tokens[restore_pos:]
+        is_exact = is_exact and len(remaining) == 1
+        if self._single_session:
+            self.clear()
+            return prompt_cache, remaining, None, is_exact
         self._access_counter += 1
         self._last_used[best_index] = self._access_counter
-        remaining = prompt_tokens[restore_pos:]
 
         return prompt_cache, remaining, best_index, is_exact
 

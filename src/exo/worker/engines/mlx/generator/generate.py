@@ -572,6 +572,12 @@ def mlx_generate(
     if vision is not None:
         all_prompt_tokens = vision.prompt_tokens
     media_regions: list[MediaRegion] = vision.media_regions if vision else []
+    context_limit = int(os.getenv("EXO_MAX_CONTEXT_TOKENS", "0"))
+    requested_output = task.max_output_tokens or MAX_TOKENS
+    if context_limit and len(all_prompt_tokens) + requested_output > context_limit:
+        raise ValueError(
+            f"Prompt plus requested output exceeds the {context_limit}-token context limit"
+        )
 
     # Do not use the prefix cache if we are trying to do benchmarks.
     is_bench = task.bench
@@ -733,6 +739,8 @@ def mlx_generate(
         ),
         start=1,
     ):
+        if kv_prefix_cache is not None:
+            kv_prefix_cache.record_generated_token(out.token)
         generated_text_parts.append(out.text)
         accumulated_text += out.text
 

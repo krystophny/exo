@@ -39,7 +39,7 @@ import contextlib
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.utils import load_model
+from mlx_lm.utils import load_config, load_model
 from pydantic import RootModel
 
 from exo.download.download_utils import build_model_path
@@ -173,7 +173,13 @@ def load_mlx_items(
         logger.info(f"Single device used for {bound_instance.instance}")
         model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
         start_time = time.perf_counter()
-        model, _ = load_model(model_path, lazy=True, strict=False)
+        native_glm = load_config(model_path).get("model_type") == "glm_moe_dsa"
+        model, _ = load_model(
+            model_path,
+            lazy=True,
+            strict=native_glm,
+            model_config={"model_file": None} if native_glm else {},
+        )
         # Eval layers one by one for progress reporting
         try:
             inner = get_inner_model(model)
@@ -236,7 +242,13 @@ def shard_and_load(
 ) -> Generator[ModelLoadingResponse, None, tuple[nn.Module, TokenizerWrapper]]:
     model_path = build_model_path(shard_metadata.model_card.model_id)
 
-    model, _ = load_model(model_path, lazy=True, strict=False)
+    native_glm = load_config(model_path).get("model_type") == "glm_moe_dsa"
+    model, _ = load_model(
+        model_path,
+        lazy=True,
+        strict=native_glm,
+        model_config={"model_file": None} if native_glm else {},
+    )
     logger.debug(model)
     if hasattr(model, "model") and isinstance(model.model, DeepseekV3Model):  # type: ignore
         pass
@@ -818,7 +830,16 @@ def set_wired_limit_for_model(model_size: Memory):
             "MB. This can be slow. See the documentation for possible work-arounds: "
             "https://github.com/ml-explore/mlx-lm/tree/main#large-models"
         )
-    mx.set_wired_limit(max_rec_size.in_bytes)
+    if limit := os.getenv("EXO_MLX_MEMORY_LIMIT_GIB"):
+        memory_limit = int(float(limit) * (1 << 30))
+        if memory_limit <= 0:
+            raise ValueError("EXO_MLX_MEMORY_LIMIT_GIB must be positive")
+        mx.set_memory_limit(memory_limit)
+        mx.set_wired_limit(min(memory_limit, max_rec_size.in_bytes))
+    else:
+        mx.set_wired_limit(max_rec_size.in_bytes)
+    if limit := os.getenv("EXO_MLX_CACHE_LIMIT_GIB"):
+        mx.set_cache_limit(int(float(limit) * (1 << 30)))
     logger.info(f"Wired limit set to {max_rec_size}.")
 
 
