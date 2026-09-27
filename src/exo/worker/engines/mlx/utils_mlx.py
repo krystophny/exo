@@ -493,7 +493,7 @@ def _needs_v4_encoding(task_params: TextGenerationTaskParams) -> bool:
 
 def _v4_reasoning_effort(task_params: TextGenerationTaskParams) -> str | None:
     effort = task_params.reasoning_effort
-    if effort == "xhigh":
+    if effort in ("xhigh", "max"):
         return "max"
     if effort == "high":
         return "high"
@@ -619,7 +619,10 @@ def render_chat_template(
                 if isinstance(rc, str) and rc:
                     msg["thinking"] = rc
 
-    extra_kwargs: dict[str, Any] = {}
+    # Preserve explicit template controls used by models whose thinking mode is
+    # not represented by OpenAI reasoning_effort (for example MiniMax M3's
+    # thinking_mode=enabled). Protocol-level controls below deliberately win.
+    extra_kwargs: dict[str, Any] = dict(task_params.chat_template_kwargs or {})
     if task_params.enable_thinking is not None:
         # Qwen3 and GLM use "enable_thinking"; DeepSeek uses "thinking".
         # Jinja ignores unknown variables, so passing both is safe.
