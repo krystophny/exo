@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Generator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -38,7 +39,7 @@ import contextlib
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.utils import load_model
+from mlx_lm.utils import load_config, load_model
 from pydantic import RootModel
 
 from exo.download.download_utils import build_model_path
@@ -64,6 +65,7 @@ from exo.worker.engines.mlx.auto_parallel import (
     pipeline_auto_parallel,
     tensor_auto_parallel,
 )
+from exo.worker.engines.mlx.mtp import mtp_enabled, mtp_weights_path
 from exo.worker.engines.mlx.types import Model
 from exo.worker.runner.bootstrap import logger
 
@@ -172,7 +174,15 @@ def load_mlx_items(
         logger.info(f"Single device used for {bound_instance.instance}")
         model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
         start_time = time.perf_counter()
-        model, _ = load_model(model_path, lazy=True, strict=False)
+        native_glm = load_config(model_path).get("model_type") == "glm_moe_dsa"
+        model, _ = load_model(
+            model_path,
+            lazy=True,
+            strict=native_glm,
+            model_config={"model_file": None} if native_glm else {},
+            mtp_path=mtp_weights_path(),
+        )
+        mtp_enabled(model)
         # Eval layers one by one for progress reporting
         try:
             inner = get_inner_model(model)
@@ -235,7 +245,18 @@ def shard_and_load(
 ) -> Generator[ModelLoadingResponse, None, tuple[nn.Module, TokenizerWrapper]]:
     model_path = build_model_path(shard_metadata.model_card.model_id)
 
-    model, _ = load_model(model_path, lazy=True, strict=False)
+    native_glm = load_config(model_path).get("model_type") == "glm_moe_dsa"
+    model, _ = load_model(
+        model_path,
+        lazy=True,
+        strict=native_glm,
+        model_config={"model_file": None} if native_glm else {},
+        mtp_path=mtp_weights_path(),
+    )
+    if mtp_enabled(model) and not isinstance(shard_metadata, TensorShardMetadata):
+        raise ValueError(
+            "Native MTP requires tensor parallelism for distributed inference"
+        )
     logger.debug(model)
     if hasattr(model, "model") and isinstance(model.model, DeepseekV3Model):  # type: ignore
         pass
@@ -492,7 +513,7 @@ def _needs_v4_encoding(task_params: TextGenerationTaskParams) -> bool:
 
 def _v4_reasoning_effort(task_params: TextGenerationTaskParams) -> str | None:
     effort = task_params.reasoning_effort
-    if effort == "xhigh":
+    if effort in ("xhigh", "max"):
         return "max"
     if effort == "high":
         return "high"
@@ -618,7 +639,10 @@ def render_chat_template(
                 if isinstance(rc, str) and rc:
                     msg["thinking"] = rc
 
-    extra_kwargs: dict[str, Any] = {}
+    # Preserve explicit template controls used by models whose thinking mode is
+    # not represented by OpenAI reasoning_effort (for example MiniMax M3's
+    # thinking_mode=enabled). Protocol-level controls below deliberately win.
+    extra_kwargs: dict[str, Any] = dict(task_params.chat_template_kwargs or {})
     if task_params.enable_thinking is not None:
         # Qwen3 and GLM use "enable_thinking"; DeepSeek uses "thinking".
         # Jinja ignores unknown variables, so passing both is safe.
@@ -712,6 +736,29 @@ def detect_thinking_prompt_suffix(prompt: str, tokenizer: TokenizerWrapper) -> b
     think_token = tokenizer.think_start
 
     return think_token is not None and prompt.rstrip().endswith(think_token)
+
+
+def cooperative_slots() -> int | None:
+    """Parse EXO_COOPERATIVE_SLOTS. None means cooperative slots are off.
+
+    Any integer >= 2 is a valid slot count; anything else (unset, non-integer,
+    or < 2) is rejected at startup so a misconfigured deployment fails fast
+    instead of silently falling back to a single owner.
+    """
+    raw = os.getenv("EXO_COOPERATIVE_SLOTS")
+    if raw is None:
+        return None
+    try:
+        slots = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"EXO_COOPERATIVE_SLOTS must be an integer >= 2, got {raw!r}"
+        ) from exc
+    if slots < 2:
+        raise ValueError(
+            f"EXO_COOPERATIVE_SLOTS must be an integer >= 2, got {raw!r}"
+        )
+    return slots
 
 
 def fix_unmatched_think_end_tokens(
@@ -814,7 +861,16 @@ def set_wired_limit_for_model(model_size: Memory):
             "MB. This can be slow. See the documentation for possible work-arounds: "
             "https://github.com/ml-explore/mlx-lm/tree/main#large-models"
         )
-    mx.set_wired_limit(max_rec_size.in_bytes)
+    if limit := os.getenv("EXO_MLX_MEMORY_LIMIT_GIB"):
+        memory_limit = int(float(limit) * (1 << 30))
+        if memory_limit <= 0:
+            raise ValueError("EXO_MLX_MEMORY_LIMIT_GIB must be positive")
+        mx.set_memory_limit(memory_limit)
+        mx.set_wired_limit(min(memory_limit, max_rec_size.in_bytes))
+    else:
+        mx.set_wired_limit(max_rec_size.in_bytes)
+    if limit := os.getenv("EXO_MLX_CACHE_LIMIT_GIB"):
+        mx.set_cache_limit(int(float(limit) * (1 << 30)))
     logger.info(f"Wired limit set to {max_rec_size}.")
 
 
@@ -885,10 +941,39 @@ def _parse_kimi_tool_calls(text: str):
         return [_parse_single_tool(text)]
 
 
-def mx_all_gather_tasks(
+@dataclass(frozen=True)
+class TaskGather:
+    """A task agreement whose first collective (the per-rank task counts) has
+    been queued but not read yet; see ``start_task_gather``."""
+
+    tasks: list[TextGeneration]
+    counts: mx.array
+
+
+def start_task_gather(
     tasks: list[TextGeneration],
     group: mx.distributed.Group | None,
+) -> TaskGather:
+    """Queue the all-gather of this rank's task count without waiting for it.
+
+    Collectives run on MLX's CPU stream in submission order, so a gather queued
+    between two decode steps sits behind the in-flight token's all-reduces;
+    reading it right away (``.tolist()``) holds the host until that token's GPU
+    work ends. Reading it on the next step instead (``finish_task_gather``)
+    costs nothing: by then the step has already waited for that token.
+    """
+    counts = mx.distributed.all_gather(mx.array([len(tasks)]), group=group)
+    mx.async_eval(counts)
+    return TaskGather(tasks=list(tasks), counts=counts)
+
+
+def finish_task_gather(
+    gather: TaskGather,
+    group: mx.distributed.Group | None,
 ) -> tuple[list[TextGeneration], list[TextGeneration]]:
+    """Wait for the counts, gather the task ids if any rank has tasks, and
+    return (tasks every rank has, sorted by id; this rank's other tasks)."""
+
     def encode_task_id(task_id: TaskId) -> list[int]:
         utf8_task_id = task_id.encode()
         return [
@@ -902,11 +987,9 @@ def mx_all_gather_tasks(
 
     uuid_byte_length = 36
 
+    tasks = gather.tasks
     n_tasks = len(tasks)
-    all_counts = cast(
-        list[int],
-        mx.distributed.all_gather(mx.array([n_tasks]), group=group).tolist(),
-    )
+    all_counts = cast(list[int], gather.counts.tolist())
     max_tasks = max(all_counts)
     world_size: int = 1 if group is None else group.size()
 
@@ -922,7 +1005,7 @@ def mx_all_gather_tasks(
     gathered = cast(
         list[list[list[int]]],
         mx.distributed.all_gather(mx.array(padded), group=group)
-        .reshape(world_size, max_tasks, -1)
+        .reshape(world_size, max_tasks, -1, stream=mx.Device(mx.cpu))
         .tolist(),
     )
     all_task_ids: list[list[TaskId]] = [
@@ -936,3 +1019,10 @@ def mx_all_gather_tasks(
     agreed = [local_tasks[tid] for tid in sorted(agreed_ids)]
     different = [task for task in tasks if task.task_id not in agreed_ids]
     return agreed, different
+
+
+def mx_all_gather_tasks(
+    tasks: list[TextGeneration],
+    group: mx.distributed.Group | None,
+) -> tuple[list[TextGeneration], list[TextGeneration]]:
+    return finish_task_gather(start_task_gather(tasks, group), group)

@@ -3,6 +3,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Callable
 
+import mlx.core as mx
 import pytest
 
 import exo.worker.engines.mlx.builder as mlx_builder
@@ -15,6 +16,7 @@ from exo.shared.types.events import (
     RunnerStatusUpdated,
     TaskAcknowledged,
     TaskStatusUpdated,
+    TaskTerminated,
 )
 from exo.shared.types.tasks import (
     ConnectToGroup,
@@ -46,6 +48,7 @@ from exo.shared.types.worker.runners import (
 )
 from exo.utils.channels import mp_channel
 from exo.worker.engines.mlx.builder import MlxBuilder
+from exo.worker.engines.mlx.utils_mlx import TaskGather
 from exo.worker.runner.runner import Runner
 
 from ...constants import (
@@ -142,6 +145,17 @@ def patch_out_mlx(monkeypatch: pytest.MonkeyPatch):
         return (tasks, [])
 
     monkeypatch.setattr(mlx_batch_generator, "mx_all_gather_tasks", fake_all_gather)
+
+    def fake_start_gather(tasks: list[TextGeneration], group: object) -> TaskGather:
+        return TaskGather(tasks=list(tasks), counts=mx.array([len(tasks)]))
+
+    def fake_finish_gather(
+        gather: TaskGather, group: object
+    ) -> tuple[list[TextGeneration], list[TextGeneration]]:
+        return (gather.tasks, [])
+
+    monkeypatch.setattr(mlx_batch_generator, "start_task_gather", fake_start_gather)
+    monkeypatch.setattr(mlx_batch_generator, "finish_task_gather", fake_finish_gather)
     # Mock apply_chat_template since we're using a fake tokenizer (integer 1).
     # Returns a prompt without thinking tag so detect_thinking_prompt_suffix returns None.
     monkeypatch.setattr(
@@ -354,6 +368,7 @@ def test_events_processed_in_correct_order(patch_out_mlx: pytest.MonkeyPatch):
             TaskStatusUpdated(
                 task_id=CHAT_COMPLETION_TASK_ID, task_status=TaskStatus.Complete
             ),
+            TaskTerminated(task_id=CHAT_COMPLETION_TASK_ID, runner_id=RUNNER_1_ID),
             # CHAT COMPLETION TASK SHOULD COMPLETE BEFORE RUNNER READY
             RunnerStatusUpdated(runner_id=RUNNER_1_ID, runner_status=RunnerReady()),
             TaskStatusUpdated(task_id=SHUTDOWN_TASK_ID, task_status=TaskStatus.Running),

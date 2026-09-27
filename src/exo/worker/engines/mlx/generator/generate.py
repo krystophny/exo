@@ -1,6 +1,7 @@
 import contextlib
 import functools
 import math
+import os
 import time
 import uuid
 from typing import Callable, Generator, cast, get_args
@@ -56,9 +57,11 @@ from exo.worker.engines.mlx.constants import (
     MAX_TOKENS,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
+from exo.worker.engines.mlx.mtp import mtp_enabled
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
+    cooperative_slots,
     fix_unmatched_think_end_tokens,
     mx_barrier,
     system_prompt_token_count,
@@ -288,6 +291,7 @@ def prefill(
     group: mx.distributed.Group | None,
     on_prefill_progress: Callable[[int, int], None] | None,
     distributed_prompt_progress_callback: Callable[[], None] | None,
+    prefill_step_size_override: int | None = None,
 ) -> tuple[float, int, list[CacheSnapshot]]:
     """Prefill the KV cache with prompt tokens.
 
@@ -331,7 +335,7 @@ def prefill(
 
     is_pipeline = _has_pipeline_communication_layer(model)
 
-    prefill_step_size = 4096
+    prefill_step_size = prefill_step_size_override or int(os.getenv("EXO_PREFILL_STEP_SIZE", "4096"))
 
     try:
         if is_pipeline and num_tokens >= prefill_step_size:
@@ -540,12 +544,17 @@ def mlx_generate(
     distributed_prompt_progress_callback: Callable[[], None] | None = None,
     on_generation_token: Callable[[], None] | None = None,
     vision_processor: VisionProcessor | None = None,
+    prefill_step_size_override: int | None = None,
 ) -> Generator[GenerationResponse]:
     # Ensure that generation stats only contains peak memory for this generation
     mx.reset_peak_memory()
     # TODO: Randomise task seed and set in taskparams, instead of hard coding as 42.
     seed = task.seed or 42
     mx.random.seed(seed)
+
+    use_mtp = mtp_enabled(model)
+    if use_mtp and vision_processor is not None:
+        raise ValueError("Native MTP currently supports text-only generation")
 
     # Encode prompt once at the top and fix unmatched think tags
     all_prompt_tokens = encode_prompt(tokenizer, prompt)
@@ -571,6 +580,12 @@ def mlx_generate(
     if vision is not None:
         all_prompt_tokens = vision.prompt_tokens
     media_regions: list[MediaRegion] = vision.media_regions if vision else []
+    context_limit = int(os.getenv("EXO_MAX_CONTEXT_TOKENS", "0"))
+    requested_output = task.max_output_tokens or MAX_TOKENS
+    if context_limit and len(all_prompt_tokens) + requested_output > context_limit:
+        raise ValueError(
+            f"Prompt plus requested output exceeds the {context_limit}-token context limit"
+        )
 
     # Do not use the prefix cache if we are trying to do benchmarks.
     is_bench = task.bench
@@ -618,6 +633,17 @@ def mlx_generate(
         top_k=task.top_k if task.top_k is not None else 0,
     )
 
+    if cooperative_slots() is not None:
+        from exo.worker.engines.mlx.session_sampling import make_session_sampler
+
+        sampler = make_session_sampler(
+            seed,
+            task.temperature if task.temperature is not None else 0.7,
+            task.top_p if task.top_p is not None else 1.0,
+            task.min_p if task.min_p is not None else 0.05,
+            task.top_k if task.top_k is not None else 0,
+        )
+
     # Normalize stop sequences to a list
     stop_sequences: list[str] = (
         ([task.stop] if isinstance(task.stop, str) else task.stop)
@@ -638,7 +664,8 @@ def mlx_generate(
         else contextlib.nullcontext()
     )
     use_remote = (
-        len(prompt_tokens) > REMOTE_PREFILL_MIN_TOKENS
+        not use_mtp
+        and len(prompt_tokens) > REMOTE_PREFILL_MIN_TOKENS
         and task.prefill_endpoint is not None
     )
     remote_prefilled = False
@@ -662,7 +689,7 @@ def mlx_generate(
                 logger.opt(exception=True).warning(
                     "Remote prefill failed, falling back to local prefill"
                 )
-        if not remote_prefilled:
+        if not remote_prefilled and not use_mtp:
             prefill_tps, prefill_tokens, ssm_snapshots_list = prefill(
                 model,
                 tokenizer,
@@ -672,6 +699,7 @@ def mlx_generate(
                 group,
                 on_prefill_progress,
                 distributed_prompt_progress_callback,
+                prefill_step_size_override,
             )
     cache_snapshots: list[CacheSnapshot] | None = ssm_snapshots_list or None
 
@@ -707,7 +735,7 @@ def mlx_generate(
             )
 
     # stream_generate starts from the last token
-    last_token = prompt_tokens[-2:]
+    last_token = prompt_tokens if use_mtp else prompt_tokens[-2:]
 
     max_tokens = task.max_output_tokens or MAX_TOKENS
     accumulated_text = ""
@@ -717,111 +745,138 @@ def mlx_generate(
     logger.info("Starting decode")
     mx_barrier(group)
 
-    for completion_tokens, out in enumerate(
-        stream_generate(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=last_token,
-            max_tokens=max_tokens,
-            sampler=sampler,
-            logits_processors=logits_processors,
-            prompt_cache=caches,
-            prefill_step_size=1,
-            kv_group_size=KV_GROUP_SIZE,
-            kv_bits=KV_BITS,
-        ),
-        start=1,
-    ):
-        generated_text_parts.append(out.text)
-        accumulated_text += out.text
+    def mtp_progress(processed: int, total: int) -> None:
+        if on_prefill_progress is not None:
+            on_prefill_progress(processed, total)
+        if distributed_prompt_progress_callback is not None:
+            distributed_prompt_progress_callback()
 
-        # Check for stop sequences
-        text = out.text
-        finish_reason: FinishReason | None = cast(
-            FinishReason | None, out.finish_reason
+    mtp_options: dict[str, object] = {}
+    if cooperative_slots() is not None:
+        mtp_options["manage_wired_limit"] = False
+    if use_mtp:
+        mtp_options.update(
+            {
+                "mtp": True,
+                "mtp_num_draft_tokens": int(os.getenv("EXO_MTP_DRAFT_TOKENS", "1")),
+                "logits_processor_tokens": all_prompt_tokens,
+                "prompt_progress_callback": mtp_progress,
+            }
         )
-        stop_matched = False
+    responses = stream_generate(
+        model=model,
+        draft_model=None,
+        tokenizer=tokenizer,
+        prompt=last_token,
+        max_tokens=max_tokens,
+        sampler=sampler,
+        logits_processors=logits_processors,
+        prompt_cache=caches,
+        prefill_step_size=(prefill_step_size_override or int(os.getenv("EXO_PREFILL_STEP_SIZE", "256")))
+        if use_mtp
+        else 1,
+        kv_group_size=KV_GROUP_SIZE,
+        kv_bits=KV_BITS,
+        **mtp_options,
+    )
+    with contextlib.closing(responses):
+        for completion_tokens, out in enumerate(responses, start=1):
+            if kv_prefix_cache is not None:
+                kv_prefix_cache.record_generated_token(out.token)
+            generated_text_parts.append(out.text)
+            accumulated_text += out.text
 
-        if stop_sequences:
-            for stop_seq in stop_sequences:
-                if stop_seq in accumulated_text:
-                    # Trim text to just before the stop sequence
-                    stop_index = accumulated_text.find(stop_seq)
-                    text_before_stop = accumulated_text[:stop_index]
-                    chunk_start = len(accumulated_text) - len(out.text)
-                    text = text_before_stop[chunk_start:]
-                    finish_reason = "stop"
-                    stop_matched = True
-                    break
-
-        is_done = finish_reason is not None
-
-        stats: GenerationStats | None = None
-        if is_done:
-            stats = GenerationStats(
-                prompt_tps=float(prefill_tps or out.prompt_tps),
-                generation_tps=float(out.generation_tps),
-                prompt_tokens=int(prefill_tokens + out.prompt_tokens),
-                generation_tokens=int(out.generation_tokens),
-                peak_memory_usage=Memory.from_gb(out.peak_memory),
+            # Check for stop sequences
+            text = out.text
+            finish_reason: FinishReason | None = cast(
+                FinishReason | None, out.finish_reason
             )
-            if not stop_matched and out.finish_reason not in get_args(FinishReason):
-                logger.warning(
-                    f"Model generated unexpected finish_reason: {out.finish_reason}"
+            stop_matched = False
+
+            if stop_sequences:
+                for stop_seq in stop_sequences:
+                    if stop_seq in accumulated_text:
+                        # Trim text to just before the stop sequence
+                        stop_index = accumulated_text.find(stop_seq)
+                        text_before_stop = accumulated_text[:stop_index]
+                        chunk_start = len(accumulated_text) - len(out.text)
+                        text = text_before_stop[chunk_start:]
+                        finish_reason = "stop"
+                        stop_matched = True
+                        break
+
+            is_done = finish_reason is not None
+
+            stats: GenerationStats | None = None
+            if is_done:
+                stats = GenerationStats(
+                    prompt_tps=float(prefill_tps or out.prompt_tps),
+                    generation_tps=float(out.generation_tps),
+                    prompt_tokens=int(prefill_tokens + out.prompt_tokens),
+                    generation_tokens=int(out.generation_tokens),
+                    peak_memory_usage=Memory.from_gb(out.peak_memory),
+                )
+                if not stop_matched and out.finish_reason not in get_args(FinishReason):
+                    logger.warning(
+                        f"Model generated unexpected finish_reason: {out.finish_reason}"
+                    )
+
+                total_prompt_tokens = len(all_prompt_tokens)
+                usage = Usage(
+                    prompt_tokens=total_prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_prompt_tokens + completion_tokens,
+                    prompt_tokens_details=PromptTokensDetails(
+                        cached_tokens=prefix_hit_length
+                    ),
+                    completion_tokens_details=CompletionTokensDetails(
+                        reasoning_tokens=0
+                    ),
                 )
 
-            total_prompt_tokens = len(all_prompt_tokens)
-            usage = Usage(
-                prompt_tokens=total_prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_prompt_tokens + completion_tokens,
-                prompt_tokens_details=PromptTokensDetails(
-                    cached_tokens=prefix_hit_length
-                ),
-                completion_tokens_details=CompletionTokensDetails(reasoning_tokens=0),
-            )
+            # Extract logprobs from the full vocabulary logprobs array
+            logprob: float | None = None
+            top_logprobs: list[TopLogprobItem] | None = None
+            if task.logprobs:
+                with mx.stream(generation_stream):
+                    logprob, top_logprobs = extract_top_logprobs(
+                        logprobs=out.logprobs,
+                        tokenizer=tokenizer,
+                        top_logprobs=task.top_logprobs or DEFAULT_TOP_LOGPROBS,
+                        selected_token=out.token,
+                    )
 
-        # Extract logprobs from the full vocabulary logprobs array
-        logprob: float | None = None
-        top_logprobs: list[TopLogprobItem] | None = None
-        if task.logprobs:
-            with mx.stream(generation_stream):
-                logprob, top_logprobs = extract_top_logprobs(
-                    logprobs=out.logprobs,
-                    tokenizer=tokenizer,
-                    top_logprobs=task.top_logprobs or DEFAULT_TOP_LOGPROBS,
-                    selected_token=out.token,
+            if is_done:
+                # Log generation stats
+                generation_elapsed = time.perf_counter() - generation_start_time
+                generated_tokens = len(generated_text_parts)
+                generation_tps = (
+                    generated_tokens / generation_elapsed
+                    if generation_elapsed > 0
+                    else 0.0
                 )
+                logger.debug(
+                    f"Generation complete: prefill {len(prompt_tokens)} tokens @ "
+                    f"{prefill_tps:.1f} tok/s, generated {generated_tokens} tokens @ "
+                    f"{generation_tps:.1f} tok/s"
+                )
+            if on_generation_token is not None:
+                on_generation_token()
 
-        if is_done:
-            # Log generation stats
-            generation_elapsed = time.perf_counter() - generation_start_time
-            generated_tokens = len(generated_text_parts)
-            generation_tps = (
-                generated_tokens / generation_elapsed if generation_elapsed > 0 else 0.0
+            yield GenerationResponse(
+                text=text,
+                token=out.token,
+                logprob=logprob,
+                top_logprobs=top_logprobs,
+                finish_reason=finish_reason,
+                stats=stats,
+                usage=usage,
             )
-            logger.debug(
-                f"Generation complete: prefill {prompt_tokens} tokens @ "
-                f"{prefill_tps:.1f} tok/s, generated {generated_tokens} tokens @ "
-                f"{generation_tps:.1f} tok/s"
-            )
-        if on_generation_token is not None:
-            on_generation_token()
 
-        yield GenerationResponse(
-            text=text,
-            token=out.token,
-            logprob=logprob,
-            top_logprobs=top_logprobs,
-            finish_reason=finish_reason,
-            stats=stats,
-            usage=usage,
-        )
+            if is_done:
+                mx_barrier(group)
+                break
 
-        if is_done:
-            mx_barrier(group)
-            break
-
-        # Limit accumulated_text to what's needed for stop sequence detection
-        if max_stop_len > 0 and len(accumulated_text) > max_stop_len:
-            accumulated_text = accumulated_text[-max_stop_len:]
+            # Limit accumulated_text to what's needed for stop sequence detection
+            if max_stop_len > 0 and len(accumulated_text) > max_stop_len:
+                accumulated_text = accumulated_text[-max_stop_len:]

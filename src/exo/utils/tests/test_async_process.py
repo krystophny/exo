@@ -2,7 +2,7 @@ import contextlib
 import os
 import signal
 import sys
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 
 import pytest
 from _pytest.capture import CaptureFixture
@@ -128,7 +128,7 @@ def _fd_count() -> int | None:
 
 
 @contextlib.asynccontextmanager
-async def _started_process(process: AsyncProcess) -> AsyncIterator[None]:
+async def _started_process(process: AsyncProcess) -> AsyncGenerator[None]:
     async with create_task_group() as task_group:
         await task_group.start(process.run)
         try:

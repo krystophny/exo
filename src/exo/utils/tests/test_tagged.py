@@ -241,10 +241,10 @@ async def test_tagged_union_is_fast():
     payload = {"L1C": {"child": {"L2C": {"child": {"L3C": {"x": 123}}}}}}
 
     with anyio.fail_after(0.1):
-        out = TypeAdapter(L1).validate_python(payload)  # type: ignore
+        out = TypeAdapter(L1).validate_python(payload)
 
     # Sanity check the result
-    assert out.__class__.__name__ == "L1C"  # type: ignore
-    assert out.child.__class__.__name__ == "L2C"  # type: ignore
-    assert out.child.child.__class__.__name__ == "L3C"  # type: ignore
-    assert out.child.child.x == 123  # type: ignore
+    assert out.__class__.__name__ == "L1C"
+    assert out.child.__class__.__name__ == "L2C"
+    assert out.child.child.__class__.__name__ == "L3C"
+    assert out.child.child.x == 123

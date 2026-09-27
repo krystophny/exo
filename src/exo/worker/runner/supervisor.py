@@ -22,6 +22,7 @@ from exo.shared.types.events import (
     RunnerStatusUpdated,
     TaskAcknowledged,
     TaskStatusUpdated,
+    TaskTerminated,
 )
 from exo.shared.types.tasks import (
     CANCEL_ALL_TASKS,
@@ -198,6 +199,7 @@ class RunnerSupervisor:
     _cancel_watch_runner: anyio.CancelScope = field(
         default_factory=anyio.CancelScope, init=False
     )
+    _stopped: anyio.Event = field(default_factory=anyio.Event, init=False)
 
     @classmethod
     async def create(
@@ -206,13 +208,14 @@ class RunnerSupervisor:
         bound_instance: BoundInstance,
         event_sender: Sender[Event],
         initialize_timeout: float = 400,
+        target: Callable[..., object] = entrypoint,
     ) -> Self:
         ev_send, ev_recv = mp_channel[Event | RunnerTerminationError]()
         task_sender, task_recv = mp_channel[Task]()
         cancel_sender, cancel_recv = mp_channel[TaskId]()
 
         runner_process = AsyncProcess(
-            target=entrypoint,
+            target=target,
             args=(
                 bound_instance,
                 ev_send,
@@ -260,20 +263,31 @@ class RunnerSupervisor:
             with contextlib.suppress(ClosedResourceError):
                 self._task_sender.close()
             with contextlib.suppress(ClosedResourceError):
-                self._event_sender.close()
-            with contextlib.suppress(ClosedResourceError):
                 self._cancel_sender.send(CANCEL_ALL_TASKS)
             with contextlib.suppress(ClosedResourceError):
                 self._cancel_sender.close()
 
-            with anyio.CancelScope(shield=True):
-                await self.runner_process.stop()
-                logger.info(
-                    f"Runner process successfully terminated: {self.runner_process.exitcode}"
-                )
+            try:
+                with anyio.CancelScope(shield=True):
+                    await self.runner_process.stop()
+                    with contextlib.suppress(ClosedResourceError, BrokenResourceError):
+                        await self._report_stopped_tasks()
+                    logger.info(
+                        f"Runner process successfully terminated: {self.runner_process.exitcode}"
+                    )
+            finally:
+                self._event_sender.close()
+                self._stopped.set()
 
     def shutdown(self):
         self._tg.cancel_tasks()
+
+    async def wait_stopped(self) -> None:
+        """Wait until run() has fully finished, including the OS process
+        actually exiting. Used to make sure a runner's resources (e.g. an
+        RDMA queue pair) are released before a replacement is created for
+        the same slot."""
+        await self._stopped.wait()
 
     async def start_task(self, task: Task):
         if task.task_id in self.pending:
@@ -281,29 +295,43 @@ class RunnerSupervisor:
                 f"Skipping invalid task {task} as it has already been submitted"
             )
             return
-        if task.task_id in self.completed:
+        if task.task_id in self.completed or task.task_id in self.cancelled:
             logger.warning(
                 f"Skipping invalid task {task} as it has already been completed"
             )
             return
-        logger.info(f"Starting task {task}")
+        logger.info(
+            f"Starting task type={type(task).__name__} "
+            f"task_id={task.task_id} instance_id={task.instance_id}"
+        )
         event = anyio.Event()
         self.pending[task.task_id] = event
         self.in_progress[task.task_id] = task
         try:
             await self._task_sender.send_async(task)
         except ClosedResourceError:
-            self.in_progress.pop(task.task_id, None)
-            logger.warning(f"Task {task} dropped, runner closed communication.")
+            await self._check_runner(ClosedResourceError("task pipe closed"))
+            logger.warning(
+                f"Task dropped after runner communication closed: "
+                f"type={type(task).__name__} task_id={task.task_id} "
+                f"instance_id={task.instance_id}"
+            )
             return
         await event.wait()
 
     async def cancel_task(self, task_id: TaskId):
-        if task_id in self.completed:
-            logger.info(f"Unable to cancel {task_id} as it has been completed")
-            self.cancelled.add(task_id)
-            return
         self.cancelled.add(task_id)
+        if task_id in self.completed or task_id not in self.in_progress:
+            # Never dispatched, or already terminal: no engine can produce more tokens.
+            await self._report_terminated(task_id)
+            return
+        if (acknowledged := self.pending.get(task_id)) is not None:
+            # Runner acknowledges immediately before submit, without stepping the
+            # engine in between. An early cancel could otherwise be consumed and lost.
+            await acknowledged.wait()
+        if task_id not in self.in_progress:
+            await self._report_terminated(task_id)
+            return
         with anyio.move_on_after(0.5) as scope:
             try:
                 await self._cancel_sender.send_async(task_id)
@@ -312,6 +340,7 @@ class RunnerSupervisor:
                 logger.warning(
                     f"Cancelling task {task_id} failed, runner closed communication"
                 )
+                await self._check_runner(ClosedResourceError("cancel pipe closed"))
         if scope.cancel_called:
             logger.error("RunnerSupervisor cancel pipe blocked")
             await self._check_runner(TimeoutError("cancel pipe blocked"))
@@ -327,7 +356,10 @@ class RunnerSupervisor:
                     if isinstance(event, RunnerStatusUpdated):
                         self.status = event.runner_status
                     if isinstance(event, TaskAcknowledged):
-                        self.pending.pop(event.task_id).set()
+                        if (
+                            pending := self.pending.pop(event.task_id, None)
+                        ) is not None:
+                            pending.set()
                         continue
                     if (
                         isinstance(event, TaskStatusUpdated)
@@ -344,6 +376,13 @@ class RunnerSupervisor:
                                 RunnerShuttingDown,
                             ),
                         )
+                        task = self.in_progress.get(event.task_id)
+                        if not isinstance(
+                            task, (TextGeneration, ImageGeneration, ImageEdits)
+                        ):
+                            self.in_progress.pop(event.task_id, None)
+                        self.completed.add(event.task_id)
+                    if isinstance(event, TaskTerminated):
                         self.in_progress.pop(event.task_id, None)
                         self.completed.add(event.task_id)
                     await self._event_sender.send(event)
@@ -351,8 +390,25 @@ class RunnerSupervisor:
             # this is the happy path shutdown - we don't need to spam log with it
             await self._check_runner()
         finally:
-            for tid in self.pending:
+            for tid in list(self.pending):
                 self.pending[tid].set()
+
+    async def _report_terminated(self, task_id: TaskId) -> None:
+        self.in_progress.pop(task_id, None)
+        self.completed.add(task_id)
+        await self._event_sender.send(
+            TaskTerminated(
+                task_id=task_id, runner_id=self.bound_instance.bound_runner_id
+            )
+        )
+
+    async def _report_stopped_tasks(self) -> None:
+        # Called only after the OS process has exited, including graceful shutdown.
+        for task_id in list(self.in_progress):
+            await self._report_terminated(task_id)
+        for pending in self.pending.values():
+            pending.set()
+        self.pending.clear()
 
     async def _watch_runner(self) -> None:
         with self._cancel_watch_runner:
@@ -376,6 +432,7 @@ class RunnerSupervisor:
 
         # If exit code is 0 then the transient errors were recoverable, meaning we don't need runner diagnostics
         if rc == 0:
+            await self._report_stopped_tasks()
             return
 
         if isinstance(rc, int) and rc < 0:
@@ -405,7 +462,7 @@ class RunnerSupervisor:
             for d in self._runner_stdio_handler.diagnostics.diagnostics()
             if not isinstance(d, RunnerUnknown)
         ]
-        for task in self.in_progress.values():
+        for task in list(self.in_progress.values()):
             if isinstance(task, (TextGeneration, ImageGeneration, ImageEdits)):
                 with anyio.CancelScope(shield=True):
                     await self._event_sender.send(
@@ -437,4 +494,5 @@ class RunnerSupervisor:
             logger.warning(
                 "Event sender already closed, unable to report runner failure"
             )
+        await self._report_stopped_tasks()
         self.shutdown()

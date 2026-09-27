@@ -16,6 +16,7 @@ from exo.shared.types.events import (
     RunnerStatusUpdated,
     TaskAcknowledged,
     TaskStatusUpdated,
+    TaskTerminated,
 )
 from exo.shared.types.tasks import (
     ConnectToGroup,
@@ -330,7 +331,13 @@ class Runner:
         assert isinstance(self.current_status, RunnerReady)
         assert isinstance(self.generator, Engine)
 
-        logger.info(f"received chat request: {starting_task}")
+        logger.info(
+            "received generation request "
+            f"type={type(starting_task).__name__} "
+            f"task_id={starting_task.task_id} "
+            f"command_id={starting_task.command_id} "
+            f"instance_id={starting_task.instance_id}"
+        )
         self.update_status(RunnerRunning())
         logger.info("runner running")
         self.acknowledge_task(starting_task)
@@ -347,13 +354,16 @@ class Runner:
                     case CancelledResponse():
                         finished.append(task_id)
                     case FinishedResponse():
-                        self.send_task_status(task_id, TaskStatus.Complete)
+                        self.send_task_status(task_id, result.task_status)
                         finished.append(task_id)
                     case other:
                         self.send_chunk(other, self.active_tasks[task_id].command_id)
 
             for task_id in finished:
                 self.active_tasks.pop(task_id, None)
+                self.event_sender.send(
+                    TaskTerminated(task_id=task_id, runner_id=self.runner_id)
+                )
 
             try:
                 item = self._work_queue.get_nowait()

@@ -12,7 +12,7 @@ from exo.shared.logging import logger
 from exo.shared.types.common import ModelId, TruncatingString
 
 MessageRole = Literal["user", "assistant", "system", "developer", "tool"]
-ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 # How a model wants prior-turn reasoning content handled. Drives both the
 # server-side encoder (drop vs keep) and the integration configs we emit
 # (e.g. opencode's per-model `interleaved` flag).
@@ -122,6 +122,7 @@ class TextGenerationTaskParams(BaseModel, frozen=True):
     chat_template_messages: list[dict[str, ChatTemplateValue]] | None = None
     reasoning_effort: ReasoningEffort | None = None
     enable_thinking: bool | None = None
+    chat_template_kwargs: dict[str, ChatTemplateValue] | None = None
     logprobs: bool = False
     top_logprobs: int | None = None
     min_p: float | None = None
@@ -133,6 +134,12 @@ class TextGenerationTaskParams(BaseModel, frozen=True):
     image_hashes: dict[int, Base64ImageHash] = Field(default_factory=dict)
 
     prefill_endpoint: str | None = None
+
+    # Cooperative-slot routing hints, private to the native adapter. Only the
+    # trusted chat_completions adapter sets these from internal request
+    # headers; never accept them from an untrusted client field.
+    session_class: str | None = None
+    session_key: str | None = None
 
     def with_card_sampling_defaults(self) -> "TextGenerationTaskParams":
         from exo.shared.models import model_cards

@@ -19,7 +19,7 @@ MAX_FILE_SIZE_GB = ...
 def compute_bits_per_weight(model): ...
 def hf_repo_to_path(hf_repo):  # -> Path:
     ...
-def load_config(model_path: Path) -> dict: ...
+def load_config(model_path: Path) -> dict[str, object]: ...
 def load_model(
     model_path: Path,
     lazy: bool = False,
@@ -28,6 +28,8 @@ def load_model(
     get_model_classes: Callable[
         [dict[str, Any]], Tuple[Type[nn.Module], Type[ModelArgs]]
     ] = ...,
+    trust_remote_code: bool = False,
+    mtp_path: Path | None = None,
 ) -> Tuple[nn.Module, dict[str, Any]]:
     """
     Load and initialize the model from a given path.

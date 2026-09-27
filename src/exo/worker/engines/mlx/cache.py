@@ -1,4 +1,5 @@
 import gc
+import hashlib
 import os
 from copy import deepcopy
 from typing import TYPE_CHECKING
@@ -19,10 +20,12 @@ from mlx_lm.models.deepseek_v4 import (
 from mlx_lm.models.deepseek_v4 import (
     _CompressorBranch as CompressorBranch,  # type: ignore
 )
+from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.types.memory import Memory
 from exo.worker.engines.mlx.constants import CACHE_GROUP_SIZE, KV_CACHE_BITS
+from exo.worker.engines.mlx.mtp import mtp_enabled
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.runner.bootstrap import logger
 
@@ -46,6 +49,20 @@ def _default_memory_threshold() -> float:
 _MEMORY_THRESHOLD = float(
     os.environ.get("EXO_MEMORY_THRESHOLD", _default_memory_threshold())
 )
+# Prefill needs temporary activation memory in addition to the persistent KV cache.
+# Keep a configurable reserve before starting it instead of waiting for an OOM.
+_PREFILL_MEMORY_THRESHOLD = float(
+    os.environ.get(
+        "EXO_PREFILL_MEMORY_THRESHOLD",
+        max(0.0, _MEMORY_THRESHOLD - 0.10),
+    )
+)
+
+if not 0.0 <= _PREFILL_MEMORY_THRESHOLD <= _MEMORY_THRESHOLD:
+    raise ValueError(
+        "EXO_PREFILL_MEMORY_THRESHOLD must be between 0 and "
+        f"EXO_MEMORY_THRESHOLD ({_MEMORY_THRESHOLD})"
+    )
 
 
 class CacheSnapshot:
@@ -95,14 +112,16 @@ def copy_rotating_kv_cache(cache: RotatingKVCache) -> RotatingKVCache | None:
 
 def _copy_arrays_cache(ac: ArraysCache) -> ArraysCache:
     entries: list[mx.array | None] = []
-    for entry in ac.cache:  # type: ignore[reportUnknownMemberType]
+    for entry in ac.cache:
         if entry is None:
             entries.append(None)
             continue
         assert isinstance(entry, mx.array)
         entries.append(_detached_copy(entry))
     copy = ArraysCache(len(entries))
-    copy.cache = entries  # type: ignore[reportUnknownMemberType]
+    copy.cache = entries
+    copy.left_padding = _detached_copy_or_none(ac.left_padding)
+    copy.lengths = _detached_copy_or_none(ac.lengths)
     return copy
 
 
@@ -117,7 +136,7 @@ def _copy_cache_list(cl: CacheList) -> CacheList:
             copied.append(_copy_arrays_cache(inner))
         else:
             copied.append(deepcopy(inner))
-    return CacheList(*copied)
+    return type(cl)(*copied)
 
 
 def _detached_copy_or_none(a: mx.array | None) -> mx.array | None:
@@ -231,6 +250,8 @@ def has_non_kv_caches(cache: KVCacheType) -> bool:
 
 class KVPrefixCache:
     def __init__(self, group: mx.distributed.Group | None):
+        self._single_session = os.getenv("EXO_PREFIX_CACHE_SINGLE_SESSION") == "1"
+        self._generated_tokens: list[int] = []
         self.prompts: list[mx.array] = []  # mx array of tokens (ints)
         self.caches: list[KVCacheType] = []
         self._snapshots: list[list[CacheSnapshot] | None] = []
@@ -242,12 +263,17 @@ class KVPrefixCache:
 
     def clear(self):
         """Clear all cached prompts and caches."""
+        self._generated_tokens.clear()
         self.prompts.clear()
         self.caches.clear()
         self._snapshots.clear()
         self._media_regions.clear()
         self._last_used.clear()
         self.prefill_tps.clear()
+
+    def record_generated_token(self, token: int) -> None:
+        if self._single_session and self.caches:
+            self._generated_tokens.append(token)
 
     def add_kv_cache(
         self,
@@ -258,9 +284,11 @@ class KVPrefixCache:
         prefill_tps: float = 0.0,
     ):
         """Add a new cache entry. Evicts LRU entries if memory is high."""
+        if self._single_session:
+            self.clear()
         self._evict_if_needed()
         self.prompts.append(prompt_tokens)
-        self.caches.append(deepcopy(cache))
+        self.caches.append(cache if self._single_session else deepcopy(cache))
         self._snapshots.append(ssm_snapshots)
         self._media_regions.append(media_regions or [])
         self.prefill_tps.append(prefill_tps)
@@ -311,6 +339,32 @@ class KVPrefixCache:
 
         return 0, None
 
+    def affinity_metadata_digest(self) -> int:
+        """Compact control-plane identity; never reads or copies KV arrays."""
+        metadata = [
+            (
+                len(prompt),
+                cache_length(self.caches[index]),
+                tuple(
+                    snapshot.token_count for snapshot in (self._snapshots[index] or [])
+                ),
+            )
+            for index, prompt in enumerate(self.prompts)
+        ]
+        return int.from_bytes(
+            hashlib.sha256(repr(metadata).encode()).digest()[:4], "little", signed=True
+        )
+
+    def prefix_match_length(self, prompt_tokens: mx.array) -> int:
+        """Read-only score for choosing an idle native cache owner."""
+        best = 0
+        for index, prompt in enumerate(self.prompts):
+            if self._single_session and self._generated_tokens:
+                prompt = mx.concatenate([prompt, mx.array(self._generated_tokens)])
+            length = get_prefix_length(prompt_tokens, prompt)
+            best = max(best, min(length, cache_length(self.caches[index])))
+        return best
+
     def get_kv_cache(
         self,
         model: Model,
@@ -343,6 +397,10 @@ class KVPrefixCache:
 
         # Find best cache match
         for i, cached_prompt in enumerate(self.prompts):
+            if self._single_session and self._generated_tokens:
+                cached_prompt = mx.concatenate(
+                    [cached_prompt, mx.array(self._generated_tokens)]
+                )
             length = get_prefix_length(prompt_tokens, cached_prompt)
             if length > 0:
                 length = self._validate_media_match(
@@ -358,6 +416,8 @@ class KVPrefixCache:
                 best_index, best_length = i, length
 
         if best_index is None:
+            if self._single_session:
+                self.clear()
             return make_kv_cache(model), prompt_tokens, None, False
 
         # For exact match: trim to max_length-1 so remaining has the last token
@@ -368,7 +428,11 @@ class KVPrefixCache:
         if has_ssm:
             target = best_length
         else:
+            # MTP entry i also depends on token i+1. Leave that matched token
+            # outside both caches so a changed suffix cannot reuse a draft pair.
             desired = (max_length - 1) if is_exact else best_length
+            if mtp_enabled(model):
+                desired = min(desired, max(0, best_length - 1))
             target = min(cached_length, desired)
         restore_pos, restore_snap = self._get_snapshot(best_index, target)
 
@@ -376,22 +440,30 @@ class KVPrefixCache:
         if restore_snap is None and has_ssm:
             return make_kv_cache(model), prompt_tokens, None, False
 
-        prompt_cache = deepcopy(self.caches[best_index])
+        prompt_cache = (
+            self.caches[best_index]
+            if self._single_session
+            else deepcopy(self.caches[best_index])
+        )
         tokens_to_trim = cached_length - restore_pos
         if tokens_to_trim > 0:
             trim_cache(prompt_cache, tokens_to_trim, restore_snap)
             # Reset cache offset to match trimmed length
             for c in prompt_cache:
-                if isinstance(c, (ArraysCache, RotatingKVCache)):
+                if isinstance(c, (ArraysCache, RotatingKVCache, CacheList)):
                     continue
                 if isinstance(c, DeepseekV4Cache):
                     continue
                 if hasattr(c, "offset"):
                     c.offset = restore_pos
 
+        remaining = prompt_tokens[restore_pos:]
+        is_exact = is_exact and len(remaining) == 1
+        if self._single_session:
+            self.clear()
+            return prompt_cache, remaining, None, is_exact
         self._access_counter += 1
         self._last_used[best_index] = self._access_counter
-        remaining = prompt_tokens[restore_pos:]
 
         return prompt_cache, remaining, best_index, is_exact
 
@@ -428,15 +500,22 @@ class KVPrefixCache:
 
     def _evict_if_needed(self):
         """Evict least recently used entries while memory usage is high."""
+        self._evict_until_below(_MEMORY_THRESHOLD, reason="memory usage")
+
+    def evict_for_prefill(self) -> None:
+        """Reserve activation headroom by evicting cached prefixes before prefill."""
+        self._evict_until_below(
+            _PREFILL_MEMORY_THRESHOLD,
+            reason="prefill activation headroom",
+        )
+
+    def _evict_until_below(self, threshold: float, *, reason: str) -> None:
         if len(self.caches) == 0:
             return
 
         evicted_any = False
         # Evict LRU entries until below threshold
-        while (
-            len(self.caches) > 0
-            and self.get_memory_used_percentage() > _MEMORY_THRESHOLD
-        ):
+        while len(self.caches) > 0 and self.get_memory_used_percentage() > threshold:
             lru_index = self._last_used.index(min(self._last_used))
             evicted_tokens = len(self.prompts[lru_index])
             self.prompts.pop(lru_index)
@@ -448,7 +527,8 @@ class KVPrefixCache:
 
             evicted_any = True
             logger.info(
-                f"KV cache evicted LRU entry ({evicted_tokens} tokens) due to memory usage"
+                f"KV cache evicted LRU entry ({evicted_tokens} tokens) "
+                f"for {reason} (target={threshold:.0%})"
             )
 
         if evicted_any:
@@ -561,6 +641,14 @@ def make_kv_cache(
     model: Model, max_kv_size: int | None = None, keep: int = 0
 ) -> KVCacheType:
     assert hasattr(model, "layers")
+
+    if mtp_enabled(model):
+        assert isinstance(model, DeepseekV32Model)
+        mtp_caches: list[CacheList] = []
+        for entry in [*model.make_cache(), model.make_mtp_cache()]:
+            assert isinstance(entry, CacheList)
+            mtp_caches.append(entry)
+        return mtp_caches
 
     if hasattr(model, "make_cache"):
         logger.info("Using MLX LM's make cache")

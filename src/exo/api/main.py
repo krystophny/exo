@@ -47,6 +47,7 @@ from exo.api.adapters.responses import (
     responses_request_to_text_generation,
 )
 from exo.api.keepalive import with_sse_keepalive
+from exo.api.private_auth import install_private_auth
 from exo.api.types import (
     AddCustomModelParams,
     AdvancedImageParams,
@@ -263,9 +264,10 @@ class API:
         self.paused_ev: anyio.Event = anyio.Event()
 
         self.app = FastAPI()
+        install_private_auth(self.app)
 
         @self.app.middleware("http")
-        async def _log_requests(  # pyright: ignore[reportUnusedFunction]
+        async def _log_requests(
             request: Request,
             call_next: Callable[[Request], Awaitable[StreamingResponse]],
         ) -> StreamingResponse:
@@ -412,13 +414,13 @@ class API:
         if path == "":
             return self.state
         try:
-            x = self.state.model_dump(by_alias=True)
+            x: object = self.state.model_dump(by_alias=True)
             for attr in path.split("/"):
                 if attr != "":
                     if isinstance(x, dict):
-                        x = x[attr]  # pyright: ignore[reportUnknownVariableType]
+                        x = cast(dict[str, object], x)[attr]
                     elif isinstance(x, list):
-                        x = x[int(attr)]  # pyright: ignore[reportUnknownVariableType]
+                        x = cast(list[object], x)[int(attr)]
             return cast(Any, x)  # pyright: ignore[reportAny]
         except Exception as e:
             raise HTTPException(
@@ -763,6 +765,7 @@ class API:
 
         This is the internal low-level stream used by all API adapters.
         """
+        completed = False
         try:
             self._text_generation_queues[command_id], recv = channel[
                 TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk
@@ -770,23 +773,24 @@ class API:
 
             with recv as token_chunks:
                 async for chunk in token_chunks:
+                    if not isinstance(chunk, PrefillProgressChunk):
+                        completed = chunk.finish_reason is not None
                     yield chunk
-                    if isinstance(chunk, PrefillProgressChunk):
-                        continue
-                    if chunk.finish_reason is not None:
+                    if completed:
                         break
-
-        except anyio.get_cancelled_exc_class():
-            command = TaskCancelled(cancelled_command_id=command_id)
-            with anyio.CancelScope(shield=True):
-                await self.command_sender.send(
-                    ForwarderCommand(origin=self._system_id, command=command)
-                )
-            raise
         finally:
-            await self._send(TaskFinished(finished_command_id=command_id))
-            if command_id in self._text_generation_queues:
-                del self._text_generation_queues[command_id]
+            # Disconnect/async-generator close must deliver cancellation before
+            # frontend cleanup, even inside a cancelled HTTP request scope.
+            with anyio.CancelScope(shield=True):
+                commands: list[Command] = []
+                if not completed:
+                    commands.append(TaskCancelled(cancelled_command_id=command_id))
+                commands.append(TaskFinished(finished_command_id=command_id))
+                for command in commands:
+                    await self.command_sender.send(
+                        ForwarderCommand(origin=self._system_id, command=command)
+                    )
+                self._text_generation_queues.pop(command_id, None)
 
     async def _collect_text_generation_with_stats(
         self, command_id: CommandId
@@ -914,10 +918,20 @@ class API:
         return command
 
     async def chat_completions(
-        self, payload: ChatCompletionRequest
+        self, payload: ChatCompletionRequest, request: Request
     ) -> ChatCompletionResponse | StreamingResponse:
-        """OpenAI Chat Completions API - adapter."""
-        task_params = await chat_request_to_text_generation(payload)
+        """OpenAI Chat Completions API - adapter.
+
+        Cooperative-slot session hints (``X-Slopcode-Session-Class`` /
+        ``X-Slopcode-Session-Key``) are read only from request headers on
+        this private, authenticated native endpoint. They are never taken
+        from the request body, which untrusted callers can shape freely.
+        """
+        session_class = request.headers.get("x-slopcode-session-class")
+        session_key = request.headers.get("x-slopcode-session-key")
+        task_params = await chat_request_to_text_generation(
+            payload, session_class=session_class, session_key=session_key
+        )
         validated_model = await self._validate_model_has_instance(task_params.model)
         task_params = task_params.model_copy(update={"model": validated_model})
 
@@ -1819,13 +1833,20 @@ class API:
         )
 
     async def add_custom_model(self, payload: AddCustomModelParams) -> ModelListModel:
-        """Fetch a model from HuggingFace and save as a custom model card, then sync across the cluster."""
-        try:
-            card = await ModelCard.fetch_from_hf(payload.model_id)
-        except Exception as exc:
+        """Register a supplied or fetched model card across the cluster."""
+        card = payload.model_card
+        if card is not None and card.model_id != payload.model_id:
             raise HTTPException(
-                status_code=400, detail=f"Failed to fetch model: {exc}"
-            ) from exc
+                status_code=400, detail="Model card ID must match model_id"
+            )
+        if card is None:
+            try:
+                card = await ModelCard.fetch_from_hf(payload.model_id)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400, detail=f"Failed to fetch model: {exc}"
+                ) from exc
+        card = card.model_copy(update={"is_custom": True})
 
         await self.command_sender.send(
             ForwarderCommand(

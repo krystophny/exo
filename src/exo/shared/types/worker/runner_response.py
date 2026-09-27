@@ -9,6 +9,7 @@ from exo.api.types import (
     TopLogprobItem,
     Usage,
 )
+from exo.shared.types.tasks import TaskStatus
 from exo.utils.pydantic_ext import TaggedModel
 
 
@@ -63,7 +64,7 @@ class ToolCallResponse(BaseRunnerResponse):
 
 
 class FinishedResponse(BaseRunnerResponse):
-    pass
+    task_status: Literal[TaskStatus.Complete, TaskStatus.Failed] = TaskStatus.Complete
 
 
 class ModelLoadingResponse(BaseRunnerResponse):

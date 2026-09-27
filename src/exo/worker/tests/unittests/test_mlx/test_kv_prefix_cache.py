@@ -105,6 +105,64 @@ class TestKVPrefix:
         cache.clear()
         assert len(cache.prompts) == 0
 
+    def test_evict_for_prefill_reserves_activation_headroom(self) -> None:
+        cache = KVPrefixCache(None)
+        cache.prompts = [mx.array([1]), mx.array([2])]
+        cache.caches = [[KVCache()], [KVCache()]]
+        cache._snapshots = [None, None]
+        cache._media_regions = [[], []]
+        cache._last_used = [0, 1]
+        cache.prefill_tps = [1.0, 2.0]
+
+        with (
+            patch(
+                "exo.worker.engines.mlx.cache._PREFILL_MEMORY_THRESHOLD",
+                0.70,
+            ),
+            patch.object(
+                cache,
+                "get_memory_used_percentage",
+                side_effect=[0.80, 0.65],
+            ),
+        ):
+            cache.evict_for_prefill()
+
+        assert len(cache.caches) == 1
+        assert cache.prompts[0].item() == 2
+
+    def test_evict_for_prefill_keeps_the_entry_just_matched(self) -> None:
+        """Headroom eviction must not discard the hit prefill is about to reuse.
+
+        The lookup runs first, which marks the matched entry most recently used,
+        so LRU eviction reaches for the other entries instead.
+        """
+        cache = KVPrefixCache(None)
+        # The stale entry is the more recently used one before the lookup, so
+        # evicting purely by LRU beforehand would have dropped the hit.
+        cache.prompts = [mx.array([1, 2, 3]), mx.array([9])]
+        cache.caches = [[KVCache()], [KVCache()]]
+        cache._snapshots = [None, None]
+        cache._media_regions = [[], []]
+        cache._last_used = [0, 1]
+        # _access_counter is monotonic and never behind _last_used in real use.
+        cache._access_counter = 1
+        cache.prefill_tps = [1.0, 2.0]
+
+        # A matching prompt means get_kv_cache never touches the model.
+        _, _, matched_index, _ = cache.get_kv_cache(
+            cast(Model, None), mx.array([1, 2, 3])
+        )
+        assert matched_index == 0
+
+        with (
+            patch("exo.worker.engines.mlx.cache._PREFILL_MEMORY_THRESHOLD", 0.70),
+            patch.object(cache, "get_memory_used_percentage", side_effect=[0.80, 0.65]),
+        ):
+            cache.evict_for_prefill()
+
+        assert len(cache.caches) == 1
+        assert cache.prompts[0].tolist() == [1, 2, 3]
+
 
 def _load_gpt_oss() -> tuple[Model, object]:
     from mlx_lm.utils import load_model
@@ -600,3 +658,47 @@ class TestKVPrefixCacheWithModel:
         assert len(kv_prefix_cache.prompts) == 1
         # The surviving entry should be the newly added one
         assert get_prefix_length(kv_prefix_cache.prompts[0], tokens) == len(tokens)
+
+
+def test_single_session_reuses_generated_prefix_without_copy(monkeypatch):
+    from mlx_lm.models.cache import MLACacheList
+
+    monkeypatch.setenv("EXO_PREFIX_CACHE_SINGLE_SESSION", "1")
+    owner = KVPrefixCache(None)
+    latent, indexer = KVCache(), KVCache()
+    data = mx.arange(7 * 64).reshape(1, 1, 7, 64).astype(mx.float32)
+    latent.update_and_fetch(data, data)
+    indexer.update_and_fetch(data, data[..., :0])
+    layer = MLACacheList(latent, indexer).to_quantized(bits=8, group_size=64)
+    live = [layer]
+    owner.add_kv_cache(mx.array([1, 2, 3, 4, 5]), live)
+    for token in (6, 7, 8):
+        owner.record_generated_token(token)
+    # Token 8 was emitted but has not entered KV yet. Reuse only evaluated KV.
+    reused, remaining, matched, exact = owner.get_kv_cache(
+        None, mx.array([1, 2, 3, 4, 5, 6, 7, 8, 9])
+    )
+    assert reused is live
+    assert remaining.tolist() == [8, 9]
+    assert matched is None
+    assert not exact
+    assert owner.caches == []
+    # Editing an earlier user message must roll both caches back consistently.
+    owner.add_kv_cache(mx.array([1, 2, 3, 4, 5, 6, 7]), reused)
+    reused, remaining, _, _ = owner.get_kv_cache(None, mx.array([1, 2, 99]))
+    assert reused[0][0].offset == reused[0][1].offset == 2
+    assert remaining.tolist() == [99]
+
+
+def test_single_session_drops_unmatched_cache_before_allocation(monkeypatch):
+    monkeypatch.setenv("EXO_PREFIX_CACHE_SINGLE_SESSION", "1")
+    owner = KVPrefixCache(None)
+    owner.add_kv_cache(mx.array([1, 2]), [KVCache()])
+
+    def allocate(_model):
+        assert owner.caches == []
+        return [KVCache()]
+
+    with patch("exo.worker.engines.mlx.cache.make_kv_cache", side_effect=allocate):
+        _, remaining, _, _ = owner.get_kv_cache(None, mx.array([8, 9]))
+    assert remaining.tolist() == [8, 9]

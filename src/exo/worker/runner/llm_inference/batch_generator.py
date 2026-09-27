@@ -3,7 +3,7 @@ import time
 from collections import deque
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 
 import mlx.core as mx
 from mlx_lm.tokenizer_utils import TokenizerWrapper
@@ -38,9 +38,12 @@ from exo.worker.engines.mlx.generator.generate import (
 )
 from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.utils_mlx import (
+    TaskGather,
     apply_chat_template,
+    finish_task_gather,
     mx_all_gather_tasks,
     mx_any,
+    start_task_gather,
 )
 from exo.worker.engines.mlx.vision import VisionProcessor
 from exo.worker.runner.bootstrap import logger
@@ -99,6 +102,9 @@ class SequentialGenerator(Engine):
     event_sender: MpSender[Event]
     vision_processor: VisionProcessor | None = None
     check_for_cancel_every: int = 50
+
+    on_cooperative_prefill_progress: Callable[[], None] | None = None
+    prefill_step_size_override: int | None = None
 
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)
     _maybe_queue: list[TextGeneration] = field(default_factory=list, init=False)
@@ -188,8 +194,14 @@ class SequentialGenerator(Engine):
             while (parsed := next(output_generator, None)) is not None:
                 output.append((task.task_id, parsed))
 
-        except (StopIteration, PrefillCancelled):
+        except StopIteration:
             output.append((task.task_id, FinishedResponse()))
+            self._active = None
+            if self._queue:
+                self._start_next()
+
+        except PrefillCancelled:
+            output.append((task.task_id, CancelledResponse()))
             self._active = None
             if self._queue:
                 self._start_next()
@@ -270,6 +282,8 @@ class SequentialGenerator(Engine):
                 raise PrefillCancelled()
 
             self.agree_on_tasks()
+            if self.on_cooperative_prefill_progress is not None:
+                self.on_cooperative_prefill_progress()
 
         tokens_since_cancel_check = self.check_for_cancel_every
 
@@ -295,6 +309,7 @@ class SequentialGenerator(Engine):
             on_generation_token=on_generation_token,
             group=self.group,
             vision_processor=self.vision_processor,
+            prefill_step_size_override=self.prefill_step_size_override,
         )
 
     def close(self) -> None:
@@ -336,6 +351,8 @@ class BatchGenerator(Engine):
     _maybe_cancel: list[TextGeneration] = field(default_factory=list, init=False)
     _all_tasks: dict[TaskId, TextGeneration] = field(default_factory=dict, init=False)
     _queue: deque[TextGeneration] = field(default_factory=deque, init=False)
+    # A decode step's task agreement, started but not read yet (_overlap_agreement).
+    _task_gather: TaskGather | None = field(default=None, init=False)
     _gen: ExoBatchGenerator = field(init=False)
     _active_tasks: dict[
         int,
@@ -374,11 +391,33 @@ class BatchGenerator(Engine):
 
     def agree_on_tasks(self) -> None:
         """Agree between all ranks about the task ordering (some may have received in different order or not at all)."""
+        self._finish_task_gather()
         agreed, different = mx_all_gather_tasks(self._maybe_queue, self.group)
         # Extend from `agreed` (sorted by task_id on all ranks) to guarantee every
         # rank enqueues tasks in the same order, preventing TP collective deadlocks.
         self._queue.extend(agreed)
         self._maybe_queue = list(different)
+
+    def _overlap_agreement(self) -> None:
+        """The task agreement of a decode step, without waiting for it: apply the
+        one the previous step started, then start this step's (see
+        ``start_task_gather``). Every rank decodes the same steps, so every rank
+        starts and finishes the same gathers in the same order; tasks are agreed
+        one decode step later than with ``agree_on_tasks``."""
+        self._finish_task_gather()
+        self._task_gather = start_task_gather(self._maybe_queue, self.group)
+
+    def _finish_task_gather(self) -> None:
+        if self._task_gather is None:
+            return
+        gather, self._task_gather = self._task_gather, None
+        agreed, different = finish_task_gather(gather, self.group)
+        self._queue.extend(agreed)
+        # Tasks submitted while the gather was in flight join the next one.
+        gathered = {task.task_id for task in gather.tasks}
+        self._maybe_queue = list(different) + [
+            task for task in self._maybe_queue if task.task_id not in gathered
+        ]
 
     def agree_on_cancellations(self) -> None:
         """Agree between all ranks about which tasks to cancel."""
@@ -403,7 +442,10 @@ class BatchGenerator(Engine):
         tuple[TaskId, GenerationChunk | CancelledResponse | FinishedResponse]
     ]:
         if not self._queue:
-            self.agree_on_tasks()
+            if self._gen.has_work:
+                self._overlap_agreement()
+            else:
+                self.agree_on_tasks()
 
         # Submit any queued tasks to the engine
         while self._queue and len(self._active_tasks) < EXO_MAX_CONCURRENT_REQUESTS:

@@ -59,7 +59,18 @@ async def fetch_image_url(url: str) -> Base64Image:
 
 async def chat_request_to_text_generation(
     request: ChatCompletionRequest,
+    session_class: str | None = None,
+    session_key: str | None = None,
 ) -> TextGenerationTaskParams:
+    """Convert a wire request into internal task params.
+
+    ``session_class``/``session_key`` are cooperative-slot routing hints.
+    Callers must derive them only from trusted internal request headers
+    (``X-Slopcode-Session-Class`` / ``X-Slopcode-Session-Key``) on the
+    private native API, never from client-controlled request body fields;
+    the native API sits behind an authenticated adapter and is not exposed
+    directly to untrusted callers.
+    """
     instructions: str | None = None
     input_messages: list[InputMessage] = []
     chat_template_messages: list[dict[str, Any]] = []
@@ -164,6 +175,7 @@ async def chat_request_to_text_generation(
         tools=request.tools,
         reasoning_effort=resolved_effort,
         enable_thinking=resolved_thinking,
+        chat_template_kwargs=request.chat_template_kwargs,
         chat_template_messages=chat_template_messages
         if chat_template_messages
         else None,
@@ -175,6 +187,8 @@ async def chat_request_to_text_generation(
         presence_penalty=request.presence_penalty,
         frequency_penalty=request.frequency_penalty,
         images=images,
+        session_class=session_class,
+        session_key=session_key,
     )
 
 

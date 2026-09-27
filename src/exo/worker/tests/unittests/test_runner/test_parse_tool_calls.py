@@ -6,7 +6,9 @@ from typing import Any
 
 from exo.shared.types.worker.runner_response import GenerationResponse, ToolCallResponse
 from exo.worker.runner.llm_inference.model_output_parsers import parse_tool_calls
-from exo.worker.runner.llm_inference.tool_parsers import make_mlx_parser
+from exo.worker.runner.llm_inference.tool_parsers import (
+    make_mlx_parser,
+)
 
 
 def _make_responses(texts: list[str]) -> Generator[GenerationResponse]:
@@ -247,3 +249,46 @@ class TestParseToolCalls:
 
         args = json.loads(results[0].tool_calls[0].arguments)  # pyright: ignore[reportAny]
         assert args == {"action": "output", "id": "0"}
+
+
+def _markup_leak_parser(_text: str) -> dict[str, Any]:
+    """Mimics a format parser that leaked protocol markup into the call."""
+    return {
+        "name": "doc_read_page",
+        "arguments": {"file<arg_key": "page</arg_key><arg_value>5"},
+    }
+
+
+class TestResidualMarkupGuard:
+    """A call whose name/arguments still carry tool-call markup is dropped."""
+
+    def test_call_with_residual_markup_is_dropped(self):
+        results = list(
+            parse_tool_calls(
+                _make_responses(["<tool_call>", "junk", "</tool_call>"]),
+                make_mlx_parser("<tool_call>", "</tool_call>", _markup_leak_parser),
+                tools=None,
+            )
+        )
+
+        assert len(results) == 1
+        # Dropped rather than dispatched: yielded as text, not a ToolCallResponse.
+        assert isinstance(results[0], GenerationResponse)
+        assert results[0].text == "<tool_call>junk</tool_call>"
+
+    def test_html_argument_is_preserved(self):
+        def parse_html(_text: str) -> dict[str, Any]:
+            return {"name": "web_fetch", "arguments": {"snippet": "<div>x</div>"}}
+
+        results = list(
+            parse_tool_calls(
+                _make_responses(["<tool_call>", "payload", "</tool_call>"]),
+                make_mlx_parser("<tool_call>", "</tool_call>", parse_html),
+                tools=None,
+            )
+        )
+        assert len(results) == 1
+        assert isinstance(results[0], ToolCallResponse)
+        assert json.loads(results[0].tool_calls[0].arguments) == {
+            "snippet": "<div>x</div>"
+        }
