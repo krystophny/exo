@@ -16,6 +16,7 @@ from exo.shared.types.events import (
     RunnerStatusUpdated,
     TaskAcknowledged,
     TaskStatusUpdated,
+    TaskTerminated,
 )
 from exo.shared.types.tasks import (
     ConnectToGroup,
@@ -367,6 +368,7 @@ def test_events_processed_in_correct_order(patch_out_mlx: pytest.MonkeyPatch):
             TaskStatusUpdated(
                 task_id=CHAT_COMPLETION_TASK_ID, task_status=TaskStatus.Complete
             ),
+            TaskTerminated(task_id=CHAT_COMPLETION_TASK_ID, runner_id=RUNNER_1_ID),
             # CHAT COMPLETION TASK SHOULD COMPLETE BEFORE RUNNER READY
             RunnerStatusUpdated(runner_id=RUNNER_1_ID, runner_status=RunnerReady()),
             TaskStatusUpdated(task_id=SHUTDOWN_TASK_ID, task_status=TaskStatus.Running),

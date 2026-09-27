@@ -17,6 +17,7 @@ from exo.routing.event_router import (
 )
 from exo.shared.apply import apply
 from exo.shared.constants import EXO_EVENT_LOG_DIR, EXO_TRACING_ENABLED
+from exo.shared.types.chunks import ErrorChunk
 from exo.shared.types.commands import (
     AddCustomModelCard,
     CreateInstance,
@@ -36,8 +37,9 @@ from exo.shared.types.commands import (
     TestCommand,
     TextGeneration,
 )
-from exo.shared.types.common import CommandId, NodeId, SessionId, SystemId
+from exo.shared.types.common import CommandId, ModelId, NodeId, SessionId, SystemId
 from exo.shared.types.events import (
+    ChunkGenerated,
     CustomModelCardAdded,
     CustomModelCardDeleted,
     Event,
@@ -53,6 +55,7 @@ from exo.shared.types.events import (
     TaskCreated,
     TaskDeleted,
     TaskStatusUpdated,
+    TaskTerminated,
     TraceEventData,
     TracesCollected,
     TracesMerged,
@@ -60,19 +63,21 @@ from exo.shared.types.events import (
 from exo.shared.types.instance_link import InstanceLink
 from exo.shared.types.state import State
 from exo.shared.types.tasks import (
+    GenerationTask,
+    TaskId,
+    TaskStatus,
+)
+from exo.shared.types.tasks import (
     ImageEdits as ImageEditsTask,
 )
 from exo.shared.types.tasks import (
     ImageGeneration as ImageGenerationTask,
 )
 from exo.shared.types.tasks import (
-    TaskId,
-    TaskStatus,
-)
-from exo.shared.types.tasks import (
     TextGeneration as TextGenerationTask,
 )
 from exo.shared.types.worker.instances import InstanceId
+from exo.shared.types.worker.runners import RunnerId
 from exo.utils.channels import Receiver, Sender
 from exo.utils.disk_event_log import DiskEventLog
 from exo.utils.event_buffer import MultiSourceBuffer
@@ -136,6 +141,12 @@ class Master:
         self.state = State()
         self._tg: TaskGroup = TaskGroup()
         self.command_task_mapping: dict[CommandId, TaskId] = {}
+        self._task_runners: dict[TaskId, set[RunnerId]] = {}
+        self._generation_tasks: dict[TaskId, GenerationTask] = {}
+        self._terminated_runners: dict[TaskId, set[RunnerId]] = {}
+        self._cancelled_tasks: set[TaskId] = set()
+        self._failed_tasks: set[TaskId] = set()
+        self._finished_tasks: set[TaskId] = set()
         self.command_receiver = command_receiver
         self.local_event_receiver = local_event_receiver
         self.global_event_sender = global_event_sender
@@ -406,6 +417,7 @@ class Master:
                                     command.cancelled_command_id
                                 )
                             ) is not None:
+                                self._cancelled_tasks.add(task_id)
                                 generated_events.append(
                                     TaskStatusUpdated(
                                         task_status=TaskStatus.Cancelled,
@@ -418,11 +430,13 @@ class Master:
                                 )
                         case TaskFinished():
                             if (
-                                task_id := self.command_task_mapping.pop(
-                                    command.finished_command_id, None
+                                task_id := self.command_task_mapping.get(
+                                    command.finished_command_id
                                 )
                             ) is not None:
-                                generated_events.append(TaskDeleted(task_id=task_id))
+                                self._finished_tasks.add(task_id)
+                                if self._can_delete_task(task_id):
+                                    generated_events.append(self._delete_task(task_id))
                             else:
                                 logger.warning(
                                     f"Finished command {command.finished_command_id} finished"
@@ -463,9 +477,37 @@ class Master:
                                     IndexedEvent(idx=i, event=event)
                                 )
                     for event in generated_events:
+                        if isinstance(event, TaskCreated) and isinstance(
+                            event.task,
+                            (TextGenerationTask, ImageGenerationTask, ImageEditsTask),
+                        ):
+                            instance = self.state.instances[event.task.instance_id]
+                            self._generation_tasks[event.task_id] = event.task
+                            self._task_runners[event.task_id] = set(
+                                instance.shard_assignments.runner_to_shard
+                            )
                         await self.event_sender.send(event)
                 except Exception as e:
                     logger.opt(exception=e).warning("Error in command processor")
+
+    def _can_delete_task(self, task_id: TaskId) -> bool:
+        return task_id in self._finished_tasks and (
+            task_id not in self._cancelled_tasks | self._failed_tasks
+            or self._task_runners.get(task_id, set())
+            <= self._terminated_runners.get(task_id, set())
+        )
+
+    def _delete_task(self, task_id: TaskId) -> TaskDeleted:
+        for command_id, mapped_task in list(self.command_task_mapping.items()):
+            if mapped_task == task_id:
+                del self.command_task_mapping[command_id]
+        self._task_runners.pop(task_id, None)
+        self._generation_tasks.pop(task_id, None)
+        self._terminated_runners.pop(task_id, None)
+        self._cancelled_tasks.discard(task_id)
+        self._failed_tasks.discard(task_id)
+        self._finished_tasks.discard(task_id)
+        return TaskDeleted(task_id=task_id)
 
     # These plan loops are the cracks showing in our event sourcing architecture - more things could be commands
     async def _plan(self) -> None:
@@ -519,11 +561,98 @@ class Master:
                             update={"when": str(datetime.now(tz=timezone.utc))}
                         )
 
+                    followup_events: list[Event] = []
+                    if isinstance(event, ChunkGenerated) and isinstance(
+                        event.chunk, ErrorChunk
+                    ):
+                        failed_task = self.command_task_mapping.get(event.command_id)
+                        if failed_task is not None:
+                            self._failed_tasks.add(failed_task)
+                    if isinstance(event, TaskStatusUpdated) and (
+                        event.task_status == TaskStatus.Failed
+                        and event.task_id in self._task_runners
+                    ):
+                        self._failed_tasks.add(event.task_id)
+                    if isinstance(event, ChunkGenerated) and not isinstance(
+                        event.chunk, ErrorChunk
+                    ):
+                        task_id = self.command_task_mapping.get(event.command_id)
+                        if task_id is None or task_id in self._cancelled_tasks:
+                            continue
+                    if isinstance(event, InstanceDeleted):
+                        # An unavailable instance is failure-abandon, not proof of
+                        # native cancellation. Preserve the unconfirmed owners in
+                        # the error event before dropping the frontend mapping.
+                        for command_id, task_id in list(
+                            self.command_task_mapping.items()
+                        ):
+                            task = self._generation_tasks.get(task_id)
+                            if task is None or task.instance_id != event.instance_id:
+                                continue
+                            unconfirmed = self._task_runners.get(
+                                task_id, set()
+                            ) - self._terminated_runners.get(task_id, set())
+                            followup_events.append(
+                                ChunkGenerated(
+                                    command_id=command_id,
+                                    chunk=ErrorChunk(
+                                        model=ModelId(task.task_params.model),
+                                        diagnostics=[],
+                                        error_message=(
+                                            "Instance deleted before generation termination was confirmed; "
+                                            f"unconfirmed runners: {sorted(unconfirmed)}"
+                                        ),
+                                    ),
+                                )
+                            )
+                            followup_events.append(self._delete_task(task_id))
+                    if isinstance(event, TaskStatusUpdated) and (
+                        event.task_id not in self.state.tasks
+                        and event.task_id not in self._task_runners
+                    ):
+                        continue
+                    if isinstance(event, TaskStatusUpdated) and (
+                        event.task_status == TaskStatus.Complete
+                        and (
+                            event.task_id in self._failed_tasks
+                            or (
+                                (task := self.state.tasks.get(event.task_id))
+                                is not None
+                                and task.task_status == TaskStatus.Failed
+                            )
+                        )
+                    ):
+                        continue
+                    if isinstance(event, TaskStatusUpdated) and (
+                        event.task_status != TaskStatus.Cancelled
+                        and (
+                            event.task_id in self._cancelled_tasks
+                            or (
+                                (task := self.state.tasks.get(event.task_id))
+                                is not None
+                                and task.task_status == TaskStatus.Cancelled
+                            )
+                        )
+                    ):
+                        continue
+                    if isinstance(event, TaskTerminated):
+                        assigned = self._task_runners.get(event.task_id)
+                        if assigned is not None and event.runner_id in assigned:
+                            self._terminated_runners.setdefault(
+                                event.task_id, set()
+                            ).add(event.runner_id)
+                            if self._can_delete_task(event.task_id):
+                                await self.event_sender.send(
+                                    self._delete_task(event.task_id)
+                                )
+
                     indexed = IndexedEvent(event=event, idx=len(self._event_log))
                     self.state = apply(self.state, indexed)
 
                     self._event_log.append(event)
                     await self._send_indexed_event(indexed)
+                    for followup in followup_events:
+                        await self.event_sender.send(followup)
 
     # This function is re-entrant, take care!
     async def _send_indexed_event(self, event: IndexedEvent):

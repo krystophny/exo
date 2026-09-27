@@ -765,6 +765,7 @@ class API:
 
         This is the internal low-level stream used by all API adapters.
         """
+        completed = False
         try:
             self._text_generation_queues[command_id], recv = channel[
                 TokenChunk | ErrorChunk | ToolCallChunk | PrefillProgressChunk
@@ -772,23 +773,24 @@ class API:
 
             with recv as token_chunks:
                 async for chunk in token_chunks:
+                    if not isinstance(chunk, PrefillProgressChunk):
+                        completed = chunk.finish_reason is not None
                     yield chunk
-                    if isinstance(chunk, PrefillProgressChunk):
-                        continue
-                    if chunk.finish_reason is not None:
+                    if completed:
                         break
-
-        except anyio.get_cancelled_exc_class():
-            command = TaskCancelled(cancelled_command_id=command_id)
-            with anyio.CancelScope(shield=True):
-                await self.command_sender.send(
-                    ForwarderCommand(origin=self._system_id, command=command)
-                )
-            raise
         finally:
-            await self._send(TaskFinished(finished_command_id=command_id))
-            if command_id in self._text_generation_queues:
-                del self._text_generation_queues[command_id]
+            # Disconnect/async-generator close must deliver cancellation before
+            # frontend cleanup, even inside a cancelled HTTP request scope.
+            with anyio.CancelScope(shield=True):
+                commands: list[Command] = []
+                if not completed:
+                    commands.append(TaskCancelled(cancelled_command_id=command_id))
+                commands.append(TaskFinished(finished_command_id=command_id))
+                for command in commands:
+                    await self.command_sender.send(
+                        ForwarderCommand(origin=self._system_id, command=command)
+                    )
+                self._text_generation_queues.pop(command_id, None)
 
     async def _collect_text_generation_with_stats(
         self, command_id: CommandId

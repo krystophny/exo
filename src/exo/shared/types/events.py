@@ -41,6 +41,11 @@ class TaskAcknowledged(BaseEvent):
     task_id: TaskId
 
 
+class TaskTerminated(BaseEvent):
+    task_id: TaskId
+    runner_id: RunnerId
+
+
 class TaskDeleted(BaseEvent):
     task_id: TaskId
 
@@ -153,6 +158,7 @@ Event = (
     | TaskFailed
     | TaskDeleted
     | TaskAcknowledged
+    | TaskTerminated
     | InstanceCreated
     | InstanceDeleted
     | RunnerStatusUpdated

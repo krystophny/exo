@@ -26,6 +26,7 @@ from exo.shared.types.events import (
     TaskDeleted,
     TaskFailed,
     TaskStatusUpdated,
+    TaskTerminated,
     TestEvent,
     TopologyEdgeCreated,
     TopologyEdgeDeleted,
@@ -86,6 +87,7 @@ def event_apply(event: Event, state: State) -> State:
             TestEvent()
             | ChunkGenerated()
             | TaskAcknowledged()
+            | TaskTerminated()
             | InputChunkReceived()
             | TracesCollected()
             | TracesMerged()
@@ -183,6 +185,9 @@ def apply_task_deleted(event: TaskDeleted, state: State) -> State:
 def apply_task_status_updated(event: TaskStatusUpdated, state: State) -> State:
     if event.task_id not in state.tasks:
         # maybe should raise
+        return state
+
+    if state.tasks[event.task_id].task_status == TaskStatus.Cancelled:
         return state
 
     update: dict[str, TaskStatus | None] = {
