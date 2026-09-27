@@ -220,14 +220,22 @@ class CooperativeGenerator(SequentialGenerator):
         result = self._pending
         self._pending = []
         for index, slot in enumerate(self._slots):
+            # Runner sends each yielded chunk immediately. Drain earlier slot
+            # output before another slot's prefill can interleave and directly
+            # send later tokens from that same request.
+            for task_id, response in result:
+                if isinstance(response, (FinishedResponse, CancelledResponse)):
+                    self._retire(task_id)
+                yield task_id, response
+            result.clear()
             if slot._active is not None or slot._queue:
                 result.extend(self._advance(index))
-        result.extend(self._pending)
-        self._pending = []
+            result.extend(self._pending)
+            self._pending = []
         for task_id, response in result:
             if isinstance(response, (FinishedResponse, CancelledResponse)):
                 self._retire(task_id)
-        return iter(result)
+            yield task_id, response
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:
         raise ValueError(
