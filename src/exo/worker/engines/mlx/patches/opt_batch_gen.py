@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import cast
 
@@ -6,6 +6,9 @@ import mlx.core as mx
 from mlx_lm.generate import GenerationBatch, PromptProcessingBatch, generation_stream
 
 _PRECOMPUTE_TOP_K = 20
+
+# (tokens so far, logits) -> logits, as mlx-lm calls them
+_LogitsProcessor = Callable[[mx.array, mx.array], mx.array]
 
 
 @dataclass
@@ -57,7 +60,7 @@ def take_ready_topk(batch: GenerationBatch) -> BatchTopKLogprobs:
 
 def _apply_logits_processors(
     logits: mx.array,
-    logits_processors: list[list | None] | None,
+    logits_processors: Sequence[Sequence[_LogitsProcessor] | None] | None,
     tokens: list[list[int]],
     uids: list[int],
 ) -> mx.array:
