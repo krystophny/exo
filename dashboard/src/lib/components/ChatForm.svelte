@@ -25,18 +25,13 @@
     modelTasks?: Record<string, string[]>;
     modelCapabilities?: Record<string, string[]>;
     onSend?: () => void;
-    onAutoSend: (
-      content: string,
-      files?: {
-        id: string;
-        name: string;
-        type: string;
-        textContent?: string;
-        preview?: string;
-      }[],
-    ) => void;
+    onAutoSend: (content: string, files?: ChatUploadedFile[]) => void;
     onOpenModelPicker?: () => void;
     modelDisplayOverride?: string;
+    /** The text in the input; bind it to keep a draft across remounts. */
+    message?: string;
+    /** Attached files; bind together with `message`. */
+    uploadedFiles?: ChatUploadedFile[];
   }
 
   let {
@@ -51,12 +46,12 @@
     onAutoSend,
     onOpenModelPicker,
     modelDisplayOverride,
+    message = $bindable(""),
+    uploadedFiles = $bindable([]),
   }: Props = $props();
 
-  let message = $state("");
   let textareaRef: HTMLTextAreaElement | undefined = $state();
   let fileInputRef: HTMLInputElement | undefined = $state();
-  let uploadedFiles = $state<ChatUploadedFile[]>([]);
   let isDragOver = $state(false);
   const thinkingEnabled = $derived(thinkingEnabledStore());
   let loading = $derived(isLoading());
@@ -226,6 +221,17 @@
     textareaRef.style.height = Math.min(textareaRef.scrollHeight, 150) + "px";
   }
 
+  // Keep the height right when the text is set from outside (e.g. a draft
+  // the parent puts back after a failed launch). An empty box keeps its natural
+  // one-line height: measuring it as it first appears can give the full 150px.
+  $effect(() => {
+    if (message) {
+      handleInput();
+    } else {
+      resetTextareaHeight();
+    }
+  });
+
   function resetTextareaHeight() {
     if (textareaRef) {
       textareaRef.style.height = "auto";
@@ -335,38 +341,47 @@
             class="text-xs text-exo-light-gray uppercase tracking-wider flex-shrink-0"
             >MODEL:</span
           >
-          <!-- Model button — opens the full model picker -->
-          <div class="relative flex-1 max-w-xs">
-            <button
-              type="button"
-              onclick={() => onOpenModelPicker?.()}
-              class="w-full bg-exo-medium-gray/50 border border-exo-yellow/30 rounded pl-3 pr-8 py-1.5 text-xs font-mono text-left tracking-wide cursor-pointer transition-all duration-200 hover:border-exo-yellow/50 focus:outline-none focus:border-exo-yellow/70"
-            >
-              {#if currentModelLabel}
-                <span class="text-exo-yellow truncate">{currentModelLabel}</span
-                >
-              {:else}
-                <span class="text-exo-light-gray/50">— SELECT MODEL —</span>
-              {/if}
-            </button>
-            <div
-              class="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none"
-            >
-              <svg
-                class="w-3 h-3 text-exo-yellow/60"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
+          {#if onOpenModelPicker}
+            <!-- Model button — opens the full model picker -->
+            <div class="relative flex-1 max-w-xs">
+              <button
+                type="button"
+                onclick={() => onOpenModelPicker?.()}
+                class="w-full bg-exo-medium-gray/50 border border-exo-yellow/30 rounded pl-3 pr-8 py-1.5 text-xs font-mono text-left tracking-wide cursor-pointer transition-all duration-200 hover:border-exo-yellow/50 focus:outline-none focus:border-exo-yellow/70"
               >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  stroke-width="2"
-                  d="M19 9l-7 7-7-7"
-                />
-              </svg>
+                {#if currentModelLabel}
+                  <span class="text-exo-yellow truncate"
+                    >{currentModelLabel}</span
+                  >
+                {:else}
+                  <span class="text-exo-light-gray/50">— SELECT MODEL —</span>
+                {/if}
+              </button>
+              <div
+                class="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none"
+              >
+                <svg
+                  class="w-3 h-3 text-exo-yellow/60"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                >
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    stroke-width="2"
+                    d="M19 9l-7 7-7-7"
+                  />
+                </svg>
+              </div>
             </div>
-          </div>
+          {:else}
+            <!-- No picker to open: show the model, not a button that does nothing -->
+            <span
+              class="flex-1 max-w-xs truncate py-1.5 text-xs font-mono tracking-wide text-exo-yellow"
+              >{currentModelLabel}</span
+            >
+          {/if}
         </div>
         <!-- Thinking toggle -->
         {#if modelSupportsThinking()}

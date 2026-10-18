@@ -27,6 +27,7 @@ from .utils_mlx import (
     cooperative_slots,
     initialize_mlx,
     load_mlx_items,
+    use_generation_stream_by_default,
 )
 from .vision import VisionProcessor
 
@@ -40,6 +41,9 @@ class MlxBuilder(Builder):
     tokenizer: TokenizerWrapper | None = None
     group: mx.distributed.Group | None = None
     vision_processor: VisionProcessor | None = None
+
+    def __post_init__(self) -> None:
+        use_generation_stream_by_default()
 
     def connect(self, bound_instance: BoundInstance) -> None:
         if cooperative_slots() is not None and not isinstance(

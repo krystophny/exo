@@ -1,5 +1,7 @@
 import hashlib
+import time
 from collections import defaultdict
+from collections.abc import Mapping
 from datetime import datetime, timezone
 
 import anyio
@@ -11,26 +13,31 @@ from exo.download.download_utils import is_read_only_model_dir, resolve_existing
 from exo.routing.event_router import (
     EventRouterBrokenResourceError,
     EventRouterClosedResourceError,
+    NodeEventReceiver,
 )
 from exo.shared.apply import apply
 from exo.shared.constants import EXO_MAX_INSTANCE_RETRIES
-from exo.shared.models.model_cards import ModelId, card_cache
-from exo.shared.types.chunks import InputImageChunk
+from exo.shared.models.model_cards import ModelCard, ModelId, card_cache
+from exo.shared.types.chunks import ErrorChunk, InputImageChunk
 from exo.shared.types.commands import (
+    AddCustomModelCard,
     DeleteInstance,
     ForwarderCommand,
     ForwarderDownloadCommand,
     StartDownload,
 )
-from exo.shared.types.common import CommandId, NodeId, SystemId
+from exo.shared.types.common import CommandId, NodeId, SessionId, SystemId
 from exo.shared.types.events import (
+    ChunkGenerated,
     Event,
-    IndexedEvent,
     InputChunkReceived,
     InstanceDeleted,
     NodeDownloadProgress,
     NodeGatheredInfo,
+    RunnerStatusUpdated,
+    StateSnapshot,
     TaskCreated,
+    TaskDeleted,
     TaskStatusUpdated,
     TopologyEdgeCreated,
     TopologyEdgeDeleted,
@@ -45,6 +52,7 @@ from exo.shared.types.tasks import (
     LoadModel,
     Shutdown,
     Task,
+    TaskId,
     TaskStatus,
     TextGeneration,
 )
@@ -52,7 +60,7 @@ from exo.shared.types.text_generation import Base64Image, Base64ImageHash
 from exo.shared.types.topology import Connection, SocketConnection
 from exo.shared.types.worker.downloads import DownloadCompleted
 from exo.shared.types.worker.instances import InstanceId
-from exo.shared.types.worker.runners import RunnerId
+from exo.shared.types.worker.runners import RunnerId, RunnerReady
 from exo.utils.channels import Receiver, Sender, channel
 from exo.utils.info_gatherer.info_gatherer import GatheredInfo, InfoGatherer
 from exo.utils.info_gatherer.net_profile import check_reachable
@@ -61,13 +69,20 @@ from exo.utils.task_group import TaskGroup
 from exo.worker.plan import instance_to_reset_backoff, plan
 from exo.worker.runner.supervisor import RunnerSupervisor
 
+# How often the custom model cards saved on this node are synced with the cluster state,
+# and how often the ones the cluster doesn't know yet are announced to the master.
+CUSTOM_CARD_SYNC_INTERVAL = 1.0
+CUSTOM_CARD_ANNOUNCE_INTERVAL = 10.0
+# How long the worker waits for an instance it asked to delete to go, before asking again
+DELETION_REQUEST_RETRY = 10.0
+
 
 class Worker:
     def __init__(
         self,
         node_id: NodeId,
         *,
-        event_receiver: Receiver[IndexedEvent],
+        event_receiver: NodeEventReceiver,
         event_sender: Sender[Event],
         # This is for requesting updates. It doesn't need to be a general command sender right now,
         # but I think it's the correct way to be thinking about commands
@@ -88,16 +103,30 @@ class Worker:
 
         self._system_id = SystemId()
 
-        # Buffer for input image chunks (for image editing)
+        # Images a request sends ahead of itself, kept per request until it runs here or
+        # turns out not to need this node
         self.input_chunk_buffer: dict[CommandId, dict[int, InputImageChunk]] = {}
         self.input_chunk_counts: dict[CommandId, int] = {}
-        self.image_cache: dict[Base64ImageHash, Base64Image] = {}
+        self.input_images: dict[CommandId, dict[Base64ImageHash, Base64Image]] = {}
+        self._tasks_with_inputs: dict[TaskId, CommandId] = {}
+        self._inputs_lost: set[TaskId] = set()
 
         self._download_backoff: KeyedBackoff[ModelId] = KeyedBackoff(base=0.5, cap=10.0)
         self._instance_backoff: KeyedBackoff[InstanceId] = KeyedBackoff(
             base=0.5, cap=10.0
         )
+        # When this worker last asked for an instance it gave up on to be deleted
+        self._deletion_requested: dict[InstanceId, float] = {}
         self._stopped: anyio.Event = anyio.Event()
+
+        # The latest information of each kind gathered about this node, so that a new
+        # master can be told all of it: some of it is only gathered once
+        self._gathered: dict[type[GatheredInfo], GatheredInfo] = {}
+        # After a change of master, the session whose state this worker waits for before
+        # acting on the cluster state again
+        self._awaiting_state_of: SessionId | None = None
+        # The session of the last state snapshot applied
+        self._snapshot_session: SessionId | None = None
 
     async def run(self):
         logger.info("Starting Worker")
@@ -129,23 +158,46 @@ class Worker:
     async def _forward_info(self, recv: Receiver[GatheredInfo]):
         with recv as info_stream:
             async for info in info_stream:
-                await self.event_sender.send(
-                    NodeGatheredInfo(
-                        node_id=self.node_id,
-                        when=str(datetime.now(tz=timezone.utc)),
-                        info=info,
-                    )
-                )
+                self._gathered[type(info)] = info
+                await self._send_info(info)
+
+    async def _send_info(self, info: GatheredInfo) -> None:
+        await self.event_sender.send(
+            NodeGatheredInfo(
+                node_id=self.node_id,
+                when=str(datetime.now(tz=timezone.utc)),
+                info=info,
+            )
+        )
 
     async def _event_applier(self):
         with self.event_receiver as events:
-            async for event in events:
+            async for update in events:
+                if isinstance(update, StateSnapshot):
+                    self.state = update.state
+                    self._snapshot_session = update.session
+                    if update.session == self._awaiting_state_of:
+                        self._awaiting_state_of = None
+                        # Every request from before the change of master has ended
+                        self._drop_all_inputs()
+                    continue
                 # 2. for each event, apply it to the state
-                self.state = apply(self.state, event=event)
-                event = event.event
+                self.state = apply(self.state, event=update)
+                event = update.event
 
                 if isinstance(event, InstanceDeleted):
                     self._instance_backoff.reset(event.instance_id)
+                    self._deletion_requested.pop(event.instance_id, None)
+
+                # Our runner for an instance has started: the attempts before it no longer
+                # count towards giving up on the instance, which is for one that can't start
+                if isinstance(event, RunnerStatusUpdated) and isinstance(
+                    event.runner_status, RunnerReady
+                ):
+                    for instance in self.state.instances.values():
+                        node_to_runner = instance.shard_assignments.node_to_runner
+                        if node_to_runner.get(self.node_id) == event.runner_id:
+                            self._instance_backoff.reset(instance.instance_id)
 
                 if (iid := instance_to_reset_backoff(event, self.runners)) is not None:
                     self._instance_backoff.reset(iid)
@@ -174,28 +226,113 @@ class Worker:
                                 chunks_for_image, key=lambda c: c.chunk_index
                             )
                             img = Base64Image("".join(c.data for c in sorted_chunks))
-                            self.image_cache[
+                            self.input_images.setdefault(cmd_id, {})[
                                 Base64ImageHash(
                                     hashlib.sha256(img.encode("ascii")).hexdigest()
                                 )
                             ] = img
 
-    async def _reconcile_custom_cards(self) -> None:
-        while True:
-            await anyio.sleep(1)
-            target = dict(self.state.custom_model_cards)
-            for model_id, card in target.items():
-                if card_cache.get(model_id) == card:
-                    continue
-                await card_cache.save(card)
+                if isinstance(event, TaskCreated) and isinstance(
+                    event.task, (TextGeneration, ImageEdits)
+                ):
+                    self._keep_inputs_if_needed_here(event.task)
 
-            for card in await card_cache.list_all():
-                if card.model_id not in target:
-                    await card_cache.pop(card.model_id)
+                if isinstance(event, TaskDeleted):
+                    self._inputs_lost.discard(event.task_id)
+                    if (
+                        cmd_id := self._tasks_with_inputs.pop(event.task_id, None)
+                    ) is not None:
+                        self._drop_inputs(cmd_id)
+
+    def _keep_inputs_if_needed_here(self, task: TextGeneration | ImageEdits) -> None:
+        """Every node receives every request's images; only the nodes that run it keep them."""
+        instance = self.state.instances.get(task.instance_id)
+        if (
+            instance is None
+            or self.node_id not in instance.shard_assignments.node_to_runner
+        ):
+            self._drop_inputs(task.command_id)
+        elif task.command_id in self.input_chunk_buffer:
+            self._tasks_with_inputs[task.task_id] = task.command_id
+
+    def _drop_all_inputs(self) -> None:
+        self.input_chunk_buffer.clear()
+        self.input_chunk_counts.clear()
+        self.input_images.clear()
+        self._tasks_with_inputs.clear()
+        self._inputs_lost.clear()
+
+    def _drop_inputs(self, command_id: CommandId) -> None:
+        self.input_chunk_buffer.pop(command_id, None)
+        self.input_chunk_counts.pop(command_id, None)
+        self.input_images.pop(command_id, None)
+
+    async def _report_lost_inputs(self, task: TextGeneration | ImageEdits) -> None:
+        """Fail a request whose images never reached this node.
+
+        A request's images always arrive before the request itself, so if they are missing
+        once it is here, they are not coming: this node caught up from a state snapshot part
+        way through them. Waiting would hold the request, and the model's instance, forever.
+        """
+        if task.task_id in self._inputs_lost:
+            return
+        self._inputs_lost.add(task.task_id)
+        self._drop_inputs(task.command_id)
+        logger.warning(f"Images for request {task.command_id} never reached this node")
+        await self.event_sender.send(
+            ChunkGenerated(
+                command_id=task.command_id,
+                chunk=ErrorChunk(
+                    model=ModelId(task.task_params.model),
+                    error_message=(
+                        "The request's images didn't reach every device running the "
+                        "model. Please send it again."
+                    ),
+                ),
+            )
+        )
+        await self.event_sender.send(
+            TaskStatusUpdated(task_id=task.task_id, task_status=TaskStatus.Failed)
+        )
+
+    async def _reconcile_custom_cards(self) -> None:
+        """Keep the custom model cards saved on this node in sync with the cluster.
+
+        The cluster state starts empty whenever a new master takes over (for example after
+        the whole cluster restarts), so the cards saved on the nodes are the only lasting
+        copy. Cards this node has saved are announced until the cluster knows them, and a
+        saved card is only deleted after it was in the state and then removed from it: a
+        state that is empty or still catching up never deletes anything.
+        """
+        unannounced = {card.model_id: card for card in await card_cache.list_custom()}
+        synced: Mapping[ModelId, ModelCard] = {}
+        next_announcement = 0.0
+        while True:
+            await anyio.sleep(CUSTOM_CARD_SYNC_INTERVAL)
+            target = self.state.custom_model_cards
+            for model_id, card in target.items():
+                unannounced.pop(model_id, None)
+                if synced.get(model_id) != card:
+                    await card_cache.save(card)
+            for model_id in synced.keys() - target.keys():
+                await card_cache.pop(model_id)
+            synced = target
+
+            if unannounced and anyio.current_time() >= next_announcement:
+                next_announcement = anyio.current_time() + CUSTOM_CARD_ANNOUNCE_INTERVAL
+                for card in unannounced.values():
+                    await self.command_sender.send(
+                        ForwarderCommand(
+                            origin=self._system_id,
+                            command=AddCustomModelCard(model_card=card),
+                        )
+                    )
 
     async def plan_step(self):
         while True:
             await anyio.sleep(0.1)
+            if self._awaiting_state_of is not None:
+                continue
             task: Task | None = plan(
                 self.node_id,
                 self.runners,
@@ -203,8 +340,6 @@ class Worker:
                 self.state.instances,
                 self.state.runners,
                 self.state.tasks,
-                self.input_chunk_buffer,
-                self.image_cache,
                 self._instance_backoff,
                 self._download_backoff,
             )
@@ -214,20 +349,35 @@ class Worker:
             if isinstance(task, CreateRunner):
                 iid = task.instance_id
                 if self._instance_backoff.attempts(iid) >= EXO_MAX_INSTANCE_RETRIES:
-                    logger.warning(
-                        f"Instance {iid} exceeded {EXO_MAX_INSTANCE_RETRIES} retries, requesting deletion"
-                    )
-                    await self.command_sender.send(
-                        ForwarderCommand(
-                            origin=self._system_id,
-                            command=DeleteInstance(instance_id=iid),
+                    # Plan comes back to this instance every 0.1 s until it is deleted: ask
+                    # once, and again only if it is still here after a while (the request
+                    # may have been lost, e.g. while the master changed)
+                    requested_at = self._deletion_requested.get(iid)
+                    if (
+                        requested_at is None
+                        or time.monotonic() - requested_at >= DELETION_REQUEST_RETRY
+                    ):
+                        logger.warning(
+                            f"Instance {iid} exceeded {EXO_MAX_INSTANCE_RETRIES} retries, requesting deletion"
                         )
-                    )
+                        self._deletion_requested[iid] = time.monotonic()
+                        await self.command_sender.send(
+                            ForwarderCommand(
+                                origin=self._system_id,
+                                command=DeleteInstance(instance_id=iid),
+                            )
+                        )
                     continue
 
             logger.info(f"Worker plan: {task.__class__.__name__}")
             assert task.task_status
-            await self.event_sender.send(TaskCreated(task_id=task.task_id, task=task))
+            # Generation tasks come from the cluster state, so they exist already. This
+            # node's view of the state lags the master's: announcing such a task again
+            # can recreate one the master has just cancelled or deleted.
+            if task.task_id not in self.state.tasks:
+                await self.event_sender.send(
+                    TaskCreated(task_id=task.task_id, task=task)
+                )
 
             # lets not kill the worker if a runner is unresponsive
             match task:
@@ -311,6 +461,12 @@ class Worker:
                             task_id=task.task_id, task_status=TaskStatus.Complete
                         )
                     )
+                case ImageEdits() if (
+                    task.task_params.total_input_chunks > 0
+                    and len(self.input_chunk_buffer.get(task.command_id, {}))
+                    < task.task_params.total_input_chunks
+                ):
+                    await self._report_lost_inputs(task)
                 case ImageEdits() if task.task_params.total_input_chunks > 0:
                     # Assemble image from chunks and inject into task
                     cmd_id = task.command_id
@@ -343,17 +499,19 @@ class Worker:
                             advanced_params=task.task_params.advanced_params,
                         ),
                     )
-                    # Cleanup buffers
-                    if cmd_id in self.input_chunk_buffer:
-                        del self.input_chunk_buffer[cmd_id]
-                    if cmd_id in self.input_chunk_counts:
-                        del self.input_chunk_counts[cmd_id]
+                    self._drop_inputs(cmd_id)
                     await self._start_runner_task(modified_task)
 
+                case TextGeneration() if task.task_params.image_hashes and not all(
+                    h in self.input_images.get(task.command_id, {})
+                    for h in task.task_params.image_hashes.values()
+                ):
+                    await self._report_lost_inputs(task)
                 case TextGeneration() if task.task_params.image_hashes:
                     cmd_id = task.command_id
+                    images = self.input_images[cmd_id]
                     resolved_images = [
-                        self.image_cache[h]
+                        images[h]
                         for _, h in sorted(task.task_params.image_hashes.items())
                     ]
                     modified_task = task.model_copy(
@@ -363,10 +521,7 @@ class Worker:
                             )
                         }
                     )
-                    if cmd_id in self.input_chunk_buffer:
-                        del self.input_chunk_buffer[cmd_id]
-                    if cmd_id in self.input_chunk_counts:
-                        del self.input_chunk_counts[cmd_id]
+                    self._drop_inputs(cmd_id)
                     await self._start_runner_task(modified_task)
                 case LoadModel(instance_id=instance_id):
                     if (instance := self.state.instances.get(instance_id)) is not None:
@@ -376,6 +531,31 @@ class Worker:
                     await self._start_runner_task(task)
                 case task:
                     await self._start_runner_task(task)
+
+    def follow_new_master(self, session_id: SessionId) -> None:
+        """Carry on under a new master, keeping this node's runners.
+
+        Until the new master's state arrives, the worker doesn't act on the state it has:
+        that is the old master's, and still holds the requests that ended with the change.
+        Call this as the node switches to the new master's session, before its state can
+        arrive.
+        """
+        if self._snapshot_session != session_id:
+            self._awaiting_state_of = session_id
+
+    async def announce_to_master(self) -> None:
+        """Tell a new master everything this worker knows about its node. The master's state
+        may lack it: the node may have just joined the master's cluster, and the last
+        updates it sent the old master may never have arrived."""
+        for info in list(self._gathered.values()):
+            await self._send_info(info)
+        for runner in list(self.runners.values()):
+            await self.event_sender.send(
+                RunnerStatusUpdated(
+                    runner_id=runner.bound_instance.bound_runner_id,
+                    runner_status=runner.status,
+                )
+            )
 
     async def shutdown(self):
         self._tg.cancel_tasks()

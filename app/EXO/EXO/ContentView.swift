@@ -136,6 +136,22 @@ struct ContentView: View {
                     Text(detail)
                         .font(.caption2)
                         .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if case .failed = controller.status {
+                    HStack(spacing: 6) {
+                        Button("Restart") {
+                            startExo()
+                        }
+                        Button("Show Logs") {
+                            controller.showLogs()
+                        }
+                        .help("Open exo's output (~/.exo/exo_app.log) in Console")
+                    }
+                    .font(.caption2)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .padding(.top, 4)
                 }
             }
             Spacer()
@@ -178,6 +194,10 @@ struct ContentView: View {
                         }
                     }
                 }
+            } else if stateService.apiState == .notResponding {
+                Label("EXO isn't responding", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundColor(.orange)
             } else {
                 Text("Connecting to EXO…")
                     .font(.caption)
@@ -361,12 +381,14 @@ struct ContentView: View {
         return []
     }
 
+    /// Only while exo is starting or running: once it has failed, what the
+    /// cluster last reported is out of date.
     private var shouldShowClusterDetails: Bool {
-        controller.status != .stopped
+        controller.status == .starting || controller.status == .running
     }
 
     private var shouldShowInstances: Bool {
-        controller.status != .stopped
+        shouldShowClusterDetails
     }
 
     private var statusDetailText: String? {
@@ -535,10 +557,7 @@ struct ContentView: View {
             },
             set: { isOn in
                 if isOn {
-                    stateService.resetTransientState()
-                    stateService.startPolling()
-                    controller.cancelPendingLaunch()
-                    controller.launchIfNeeded()
+                    startExo()
                 } else {
                     stateService.stopPolling()
                     controller.stop()
@@ -546,6 +565,14 @@ struct ContentView: View {
                 }
             }
         )
+    }
+
+    /// Switching exo on, or Restart after it has failed.
+    private func startExo() {
+        stateService.resetTransientState()
+        stateService.startPolling()
+        controller.cancelPendingLaunch()
+        controller.launchIfNeeded()
     }
 
     private func bindingForNode(_ node: NodeViewModel) -> Binding<NodeViewModel?> {
@@ -608,6 +635,7 @@ struct ContentView: View {
                 DispatchQueue.main.async {
                     // Unregister from launch at login
                     LaunchAtLoginHelper.disable()
+                    StartupPreferences().resetForUninstall()
 
                     // Move app to trash
                     self.moveAppToTrash()

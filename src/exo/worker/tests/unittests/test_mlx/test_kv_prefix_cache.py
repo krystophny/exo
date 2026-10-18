@@ -112,6 +112,7 @@ class TestKVPrefix:
         cache._snapshots = [None, None]
         cache._media_regions = [[], []]
         cache._last_used = [0, 1]
+        cache._entry_bytes = [0, 0]
         cache.prefill_tps = [1.0, 2.0]
 
         with (
@@ -119,9 +120,8 @@ class TestKVPrefix:
                 "exo.worker.engines.mlx.cache._PREFILL_MEMORY_THRESHOLD",
                 0.70,
             ),
-            patch.object(
-                cache,
-                "get_memory_used_percentage",
+            patch(
+                "exo.worker.engines.mlx.cache.get_memory_used_percentage",
                 side_effect=[0.80, 0.65],
             ),
         ):
@@ -146,6 +146,7 @@ class TestKVPrefix:
         cache._last_used = [0, 1]
         # _access_counter is monotonic and never behind _last_used in real use.
         cache._access_counter = 1
+        cache._entry_bytes = [0, 0]
         cache.prefill_tps = [1.0, 2.0]
 
         # A matching prompt means get_kv_cache never touches the model.
@@ -156,7 +157,10 @@ class TestKVPrefix:
 
         with (
             patch("exo.worker.engines.mlx.cache._PREFILL_MEMORY_THRESHOLD", 0.70),
-            patch.object(cache, "get_memory_used_percentage", side_effect=[0.80, 0.65]),
+            patch(
+                "exo.worker.engines.mlx.cache.get_memory_used_percentage",
+                side_effect=[0.80, 0.65],
+            ),
         ):
             cache.evict_for_prefill()
 

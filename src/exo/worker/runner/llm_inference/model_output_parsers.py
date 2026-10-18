@@ -430,10 +430,11 @@ def parse_tool_calls(
         # Tool arguments and raw text are model output; log shape only.
         logger.info(f"parsed tool call text into {len(parsed) if parsed else 0} calls")
         if parsed is None or _tool_call_contains_control_markup(parsed):
+            # What the model wrote isn't a tool call we can read: give it back as
+            # text with the model's own finish reason, as other OpenAI-compatible
+            # servers do, rather than failing the request or cutting it short.
             logger.warning(f"tool call parsing failed for {len(text)} characters")
-            return response.model_copy(
-                update={"text": text, "token": 0, "finish_reason": "stop"}
-            )
+            return response.model_copy(update={"text": text, "token": 0})
         return ToolCallResponse(
             tool_calls=parsed,
             usage=response.usage,
@@ -453,10 +454,14 @@ def parse_tool_calls(
                 )
                 tool_block = tool_call_text[:end_index]
                 remainder = tool_call_text[end_index:]
-                parsed_response = _try_parse_tool_call(tool_block, response)
-                yield parsed_response
-                if isinstance(parsed_response, GenerationResponse):
-                    break
+                # When text follows the tool call in this chunk, that text carries
+                # the chunk's finish reason, not the tool call.
+                block_response = (
+                    response.model_copy(update={"finish_reason": None})
+                    if remainder
+                    else response
+                )
+                yield _try_parse_tool_call(tool_block, block_response)
                 in_tool_call = False
                 tool_call_text = ""
                 if remainder:
@@ -466,13 +471,7 @@ def parse_tool_calls(
                 logger.info(
                     "tool call parsing interrupted, yield partial tool call as text"
                 )
-                yield response.model_copy(
-                    update={
-                        "text": tool_call_text,
-                        "token": 0,
-                        "finish_reason": "stop",
-                    }
-                )
+                yield response.model_copy(update={"text": tool_call_text, "token": 0})
                 break
             continue
 
@@ -485,17 +484,10 @@ def parse_tool_calls(
                 if before:
                     yield response.model_copy(update={"text": before})
                 if tool_parser.end_parsing in tool_call_text:
-                    parsed_response = _try_parse_tool_call(tool_call_text, response)
-                    yield parsed_response
-                    if isinstance(parsed_response, GenerationResponse):
-                        break
+                    yield _try_parse_tool_call(tool_call_text, response)
                 else:
                     yield response.model_copy(
-                        update={
-                            "text": tool_call_text,
-                            "token": 0,
-                            "finish_reason": "stop",
-                        }
+                        update={"text": tool_call_text, "token": 0}
                     )
             else:
                 yield from pending_buffer
@@ -524,10 +516,7 @@ def parse_tool_calls(
             accumulated = ""
 
             if tool_parser.end_parsing in tool_call_text:
-                parsed_response = _try_parse_tool_call(tool_call_text, response)
-                yield parsed_response
-                if isinstance(parsed_response, GenerationResponse):
-                    break
+                yield _try_parse_tool_call(tool_call_text, response)
                 tool_call_text = ""
             else:
                 in_tool_call = True

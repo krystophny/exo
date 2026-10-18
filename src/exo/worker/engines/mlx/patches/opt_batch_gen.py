@@ -1,8 +1,9 @@
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import cast
 
 import mlx.core as mx
-from mlx_lm.generate import GenerationBatch
+from mlx_lm.generate import GenerationBatch, PromptProcessingBatch, generation_stream
 
 _PRECOMPUTE_TOP_K = 20
 
@@ -74,6 +75,29 @@ def _apply_logits_processors(
     return mx.concatenate(processed_logits, axis=0)
 
 
+def _lazy_cache_metadata(cache: list[object]) -> list[mx.array]:
+    """The per-sequence bookkeeping arrays a cache updates lazily at every step: an
+    ArraysCache's left padding and lengths, which a linear attention layer moves on by the
+    number of tokens it processed.
+
+    Most of them are never read during decode (a model builds its linear attention mask
+    from one layer's cache), so unless they are evaluated each update chains onto the last
+    and keeps every earlier one alive, each holding a small Metal buffer. A model with
+    linear attention layers (Qwen3.5) then reaches Metal's resource limit, and the runner
+    crashes: within an hour of steady generation."""
+    arrays: list[mx.array] = []
+    for entry in cache:
+        sub_caches = cast(list[object] | None, getattr(entry, "caches", None))
+        if sub_caches is not None:
+            arrays.extend(_lazy_cache_metadata(sub_caches))
+            continue
+        for name in ("left_padding", "lengths"):
+            value = cast(object, getattr(entry, name, None))
+            if isinstance(value, mx.array):
+                arrays.append(value)
+    return arrays
+
+
 def _patched_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
     self._current_tokens = self._next_tokens
     self._current_logprobs = self._next_logprobs
@@ -129,9 +153,14 @@ def _patched_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
             pending_indices,
             pending_values,
             pending_selected,
+            *_lazy_cache_metadata(self.prompt_cache),
         )
     else:
-        mx.async_eval(self._next_tokens, *self._next_logprobs)
+        mx.async_eval(
+            self._next_tokens,
+            *self._next_logprobs,
+            *_lazy_cache_metadata(self.prompt_cache),
+        )
 
     current_lp = self._current_logprobs
     if isinstance(current_lp, mx.array):
@@ -150,5 +179,24 @@ def _patched_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
     return token_list, current_lp
 
 
+_original_prompt = cast(
+    Callable[[PromptProcessingBatch, list[list[int]]], None],
+    PromptProcessingBatch.prompt,
+)
+
+
+def _prompt_after_decode_step(
+    self: PromptProcessingBatch, tokens: list[list[int]]
+) -> None:
+    """BatchGenerator._next async-evaluates the batch's next decode step and then processes new
+    prompts. Wait for that step first. With MLX_METAL_FAST_SYNCH, a tensor-parallel prompt eval
+    started while the step's collectives are still running can deadlock: its GPU work spins
+    waiting for the communication stream, which is still waiting for the step's GPU work."""
+    if tokens:
+        mx.synchronize(generation_stream)
+    _original_prompt(self, tokens)
+
+
 def apply_batch_gen_patch() -> None:
     GenerationBatch._step = _patched_step
+    PromptProcessingBatch.prompt = _prompt_after_decode_step

@@ -109,15 +109,14 @@ pub async fn open(
                 continue;
             };
 
-            // connect_peer can block for a long time (or indefinitely) when a
-            // peer is unreachable or its handshake stalls. Awaiting it here
-            // stops this task from returning to Discovery::next(), which is the
-            // only thing that drives announce() - so a single slow peer
-            // silences discovery for the whole node. Connect off-task instead.
-            let rt = runtime.clone();
-            let zid = discovered.zid;
+            // Don't wait for the connection here: a slow dial would stall discovery
+            // (and look like this node stalling). zenoh ignores dials to a peer it is
+            // already connecting to.
+            let runtime = runtime.clone();
             tokio::task::spawn(async move {
-                rt.connect_peer(&zid.into(), &[locator]).await;
+                runtime
+                    .connect_peer(&discovered.zid.into(), &[locator])
+                    .await;
             });
         }
     })));

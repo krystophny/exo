@@ -2,7 +2,6 @@
 """Cancellation must stop the native engine, not merely close the API stream."""
 
 import queue
-from pathlib import Path
 from typing import Callable, cast
 from unittest.mock import Mock
 
@@ -10,7 +9,6 @@ import anyio
 import pytest
 from anyio import to_thread
 
-import exo.master.main as master_module
 from exo.api.main import API
 from exo.master.main import Master
 from exo.shared.types.chunks import ErrorChunk, TokenChunk
@@ -23,6 +21,7 @@ from exo.shared.types.events import (
     GlobalForwarderEvent,
     InstanceDeleted,
     LocalForwarderEvent,
+    StateSnapshot,
     TaskDeleted,
     TaskStatusUpdated,
     TaskTerminated,
@@ -33,6 +32,7 @@ from exo.shared.types.worker.runner_response import CancelledResponse, FinishedR
 from exo.shared.types.worker.runners import RunnerId, RunnerReady
 from exo.utils.async_process import AsyncProcess
 from exo.utils.channels import MpSender, channel, mp_channel
+from exo.utils.task_group import TaskGroup
 from exo.worker.engines.base import Engine
 from exo.worker.plan import _cancel_tasks
 from exo.worker.runner.bootstrap import RunnerTerminationError
@@ -48,11 +48,8 @@ from exo.worker.tests.unittests.test_runner.test_event_ordering import CHAT_TASK
     ["explicit", "disconnect", "request_cancel", "normal", "failure", "guard_error"],
 )
 async def test_api_stop_reaches_engine_and_waits_all_original_ranks(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     stop: str,
 ) -> None:
-    monkeypatch.setattr(master_module, "EXO_EVENT_LOG_DIR", tmp_path)
     node = NodeId("node-a")
     rank = RunnerId("rank-a")
     sibling = RunnerId("rank-b")
@@ -72,6 +69,7 @@ async def test_api_stop_reaches_engine_and_waits_all_original_ranks(
     local_sender, local_receiver = channel[LocalForwarderEvent]()
     global_sender, global_receiver = channel[GlobalForwarderEvent]()
     download_sender, _ = channel[ForwarderDownloadCommand]()
+    snapshot_sender, _snapshot_receiver = channel[StateSnapshot]()
     session = SessionId(master_node_id=node, election_clock=0)
     master = Master(
         node,
@@ -80,6 +78,7 @@ async def test_api_stop_reaches_engine_and_waits_all_original_ranks(
         event_sender=event_sender,
         local_event_receiver=local_receiver,
         global_event_sender=global_sender,
+        snapshot_sender=snapshot_sender,
         download_command_sender=download_sender,
     )
     master.state = master.state.model_copy(
@@ -91,6 +90,10 @@ async def test_api_stop_reaches_engine_and_waits_all_original_ranks(
     api._system_id = SystemId("api")
     api._text_generation_queues = {}
     api._image_generation_queues = {}
+    api._cancelled_command_ids = set()
+    api._finished_at = {}
+    api._awaiting_acceptance = {}
+    api._tg = TaskGroup()
     native: list[Event] = []
     indexed: list[Event] = []
     changed = anyio.Event()
@@ -229,7 +232,7 @@ async def test_api_stop_reaches_engine_and_waits_all_original_ranks(
         submit(survivor)
         supervisor.in_progress[victim_id] = victim
         supervisor.in_progress[survivor.task_id] = survivor
-        stream = api._token_chunk_stream(command.command_id)
+        stream = api._token_chunk_stream(command)
         scope = anyio.CancelScope()
         first = anyio.Event()
         stopped = anyio.Event()

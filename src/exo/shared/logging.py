@@ -1,14 +1,21 @@
 import logging
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import TYPE_CHECKING, Literal, TextIO
 
 import zstandard
 from hypercorn import Config
 from hypercorn.logging import Logger as HypercornLogger
 from loguru import logger
 
+if TYPE_CHECKING:
+    from loguru import Message
+
 _MAX_LOG_ARCHIVES = 5
+# A node that runs for weeks would otherwise keep one ever-growing log file: at default
+# verbosity each request logs a few lines, ~200 MB a day under steady load
+_MAX_LOG_BYTES = 50 * 1024 * 1024
 
 
 def _zstd_compress(filepath: str) -> None:
@@ -24,6 +31,18 @@ def _once_then_never() -> Iterator[bool]:
     yield True
     while True:
         yield False
+
+
+def _rotate_at_start_and_by_size(
+    max_bytes: int,
+) -> "Callable[[Message, TextIO], bool]":
+    """Start a new log file when exo starts, and whenever the current one passes max_bytes."""
+    at_start = _once_then_never()
+
+    def should_rotate(message: "Message", file: TextIO) -> bool:
+        return next(at_start) or file.tell() + len(message) > max_bytes
+
+    return should_rotate
 
 
 class InterceptLogger(HypercornLogger):
@@ -43,6 +62,19 @@ class _InterceptHandler(logging.Handler):
         logger.opt(depth=3, exception=record.exc_info).log(level, record.getMessage())
 
 
+type ConsoleLogLevel = Literal["WARNING", "INFO", "DEBUG"]
+
+
+def console_log_level(verbosity: int) -> ConsoleLogLevel:
+    """The lowest level shown on the console: -q (verbosity -1) shows warnings and errors only,
+    the default shows info, and -v or more shows debug."""
+    if verbosity < 0:
+        return "WARNING"
+    if verbosity == 0:
+        return "INFO"
+    return "DEBUG"
+
+
 def logger_setup(log_file: Path | None, verbosity: int = 0):
     """Set up logging for this process - formatting, file handles, verbosity and output"""
 
@@ -56,11 +88,11 @@ def logger_setup(log_file: Path | None, verbosity: int = 0):
     # replace all stdlib loggers with _InterceptHandlers that log to loguru
     logging.basicConfig(handlers=[_InterceptHandler()], level=0)
 
-    if verbosity == 0:
+    if verbosity <= 0:
         logger.add(
             sys.__stderr__,  # type: ignore
             format="[ {time:hh:mm:ss.SSSSA} | <level>{level: <8}</level>] <level>{message}</level>",
-            level="INFO",
+            level=console_log_level(verbosity),
             colorize=True,
             enqueue=True,
         )
@@ -68,19 +100,18 @@ def logger_setup(log_file: Path | None, verbosity: int = 0):
         logger.add(
             sys.__stderr__,  # type: ignore
             format="[ {time:YYYY-MM-DD HH:mm:ss.SSS} | <level>{level: <8}</level> | {name}:{function}:{line} ] <level>{message}</level>",
-            level="DEBUG",
+            level=console_log_level(verbosity),
             colorize=True,
             enqueue=True,
         )
     if log_file:
-        rotate_once = _once_then_never()
         logger.add(
             log_file,
             format="[ {time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} ] {message}",
             level="DEBUG" if verbosity > 0 else "INFO",
             colorize=False,
             enqueue=True,
-            rotation=lambda _, __: next(rotate_once),
+            rotation=_rotate_at_start_and_by_size(_MAX_LOG_BYTES),
             retention=_MAX_LOG_ARCHIVES,
             compression=_zstd_compress,
         )

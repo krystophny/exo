@@ -1,3 +1,4 @@
+from collections import defaultdict
 from collections.abc import Mapping
 from copy import deepcopy
 from typing import Sequence
@@ -45,7 +46,21 @@ from exo.shared.types.worker.instances import (
     MlxJacclInstance,
     MlxRingInstance,
 )
-from exo.shared.types.worker.shards import Sharding
+from exo.shared.types.worker.runners import (
+    RunnerId,
+    RunnerLoaded,
+    RunnerReady,
+    RunnerRunning,
+    RunnerShutdown,
+    RunnerShuttingDown,
+    RunnerStatus,
+    RunnerWarmingUp,
+)
+from exo.shared.types.worker.shards import (
+    Sharding,
+    ShardMetadata,
+    TensorShardMetadata,
+)
 from exo.utils.ports import random_ephemeral_port
 
 INSTANCE_META_BACKENDS: dict[InstanceMeta, list[Backend]] = {
@@ -103,6 +118,76 @@ def _cycle_download_score(
     )
 
 
+def _not_enough_memory(
+    command: PlaceInstance,
+    cycles: Sequence[Cycle],
+    node_memory: Mapping[NodeId, MemoryUsage],
+) -> str:
+    reported = [cycle for cycle in cycles if all(node in node_memory for node in cycle)]
+    if not reported:
+        return "Waiting for the nodes to report their memory"
+    most_free = max(
+        sum((node_memory[node].ram_available for node in cycle), start=Memory())
+        for cycle in reported
+    )
+    return (
+        f"Not enough memory: {command.model_card.model_id} needs "
+        f"{command.model_card.storage_size.in_gb:.1f} GB, but connected nodes have at most "
+        f"{most_free.in_gb:.1f} GB free between them"
+    )
+
+
+# Runners whose memory is already in their node's report (loaded), or about to be freed
+_NOT_PENDING = (
+    RunnerLoaded,
+    RunnerWarmingUp,
+    RunnerReady,
+    RunnerRunning,
+    RunnerShuttingDown,
+    RunnerShutdown,
+)
+
+
+def _shard_bytes(shard: ShardMetadata) -> int:
+    """The memory a runner needs for its shard of the model."""
+    storage = shard.model_card.storage_size.in_bytes
+    if isinstance(shard, TensorShardMetadata):
+        return storage // shard.world_size
+    if shard.n_layers == 0:
+        return storage
+    return storage * (shard.end_layer - shard.start_layer) // shard.n_layers
+
+
+def memory_once_loaded(
+    node_memory: Mapping[NodeId, MemoryUsage],
+    instances: Mapping[InstanceId, Instance],
+    runners: Mapping[RunnerId, RunnerStatus],
+) -> dict[NodeId, MemoryUsage]:
+    """Each node's free memory once the runners placed on it have loaded.
+
+    A node reports the memory its loaded models use. A runner that is still starting or loading
+    (or failed, and will load again) hasn't taken its memory yet, so without this the next
+    placement would see that memory as free and could put a second model in it.
+    """
+    pending: defaultdict[NodeId, int] = defaultdict(int)
+    for instance in instances.values():
+        assignments = instance.shard_assignments
+        for node_id, runner_id in assignments.node_to_runner.items():
+            if isinstance(runners.get(runner_id), _NOT_PENDING):
+                continue
+            pending[node_id] += _shard_bytes(assignments.runner_to_shard[runner_id])
+    return {
+        node_id: usage.model_copy(
+            update={
+                "ram_available": Memory.from_bytes(
+                    max(0, usage.ram_available.in_bytes - pending[node_id])
+                )
+            }
+        )
+        for node_id, usage in node_memory.items()
+    }
+
+
 def place_instance(
     command: PlaceInstance,
     topology: Topology,
@@ -113,9 +198,24 @@ def place_instance(
     required_nodes: set[NodeId] | None = None,
     download_status: Mapping[NodeId, Sequence[DownloadProgress]] | None = None,
     node_rdma_ctl: Mapping[NodeId, NodeRdmaCtlStatus] | None = None,
+    runners: Mapping[RunnerId, RunnerStatus] | None = None,
 ) -> dict[InstanceId, Instance]:
+    """Place an instance of the command's model on the best group of nodes.
+
+    Pass the cluster's `runners` so that memory taken by instances that haven't loaded yet is
+    counted as used; without them every instance is assumed loaded.
+    """
+    if runners is not None:
+        node_memory = memory_once_loaded(node_memory, current_instances, runners)
     cycles = topology.get_cycles()
+    if not cycles:
+        raise ValueError("No nodes are available")
     candidate_cycles = list(filter(lambda it: len(it) >= command.min_nodes, cycles))
+    if not candidate_cycles:
+        largest = max(len(cycle) for cycle in cycles)
+        raise ValueError(
+            f"Needs {command.min_nodes} connected nodes, but at most {largest} are connected to each other"
+        )
 
     # Filter to cycles containing all required nodes (subset matching)
     if required_nodes:
@@ -124,11 +224,13 @@ def place_instance(
             for cycle in candidate_cycles
             if required_nodes.issubset(cycle.node_ids)
         ]
+        if not candidate_cycles:
+            raise ValueError("The chosen nodes aren't all connected to each other")
     cycles_with_sufficient_memory = filter_cycles_by_memory(
         candidate_cycles, node_memory, command.model_card.storage_size
     )
     if len(cycles_with_sufficient_memory) == 0:
-        raise ValueError("No cycles found with sufficient memory")
+        raise ValueError(_not_enough_memory(command, candidate_cycles, node_memory))
 
     if command.sharding == Sharding.Tensor:
         if not command.model_card.supports_tensor:

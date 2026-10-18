@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import os.log
 
 private let customNamespaceKey = "EXOCustomNamespace"
 private let hfTokenKey = "EXOHFToken"
@@ -8,29 +9,15 @@ private let hfEndpointKey = "EXOHFEndpoint"
 private let enableImageModelsKey = "EXOEnableImageModels"
 private let offlineModeKey = "EXOOfflineMode"
 private let fastSynchEnabledKey = "EXOFastSynchEnabled"
-private let onboardingCompletedKey = "EXOOnboardingCompleted"
 private let defaultModelsDirKey = "EXODefaultModelsDir"
 private let additionalModelsDirsKey = "EXOAdditionalModelsDirs"
 private let readOnlyModelsDirsKey = "EXOReadOnlyModelsDirs"
 private let customEnvironmentVariablesKey = "EXOCustomEnvironmentVariables"
 
-/// A user-defined environment variable that is injected into the exo child
-/// process at launch. Used as an escape hatch for env vars that don't have
-/// first-class typed UI in Settings.
-struct CustomEnvironmentVariable: Codable, Identifiable, Equatable {
-    var id: UUID
-    var key: String
-    var value: String
-
-    init(id: UUID = UUID(), key: String = "", value: String = "") {
-        self.id = id
-        self.key = key
-        self.value = value
-    }
-}
-
 @MainActor
 final class ExoProcessController: ObservableObject {
+    private static let logger = Logger(subsystem: "io.exo.EXO", category: "ExoProcess")
+
     enum Status: Equatable {
         case stopped
         case starting
@@ -54,6 +41,13 @@ final class ExoProcessController: ObservableObject {
     static let exoDirectoryURL: URL = {
         URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".exo")
     }()
+
+    /// exo's stdout and stderr. Kept apart from exo's own log directory,
+    /// ~/.exo/exo_log, which exo rotates and prunes itself.
+    static let logFile = ExoLogFile(url: exoDirectoryURL.appendingPathComponent("exo_app.log"))
+
+    /// How often the log's size is checked while exo runs.
+    private static let logRotationInterval: UInt64 = 30_000_000_000
 
     @Published private(set) var status: Status = .stopped
     @Published private(set) var lastError: String?
@@ -153,12 +147,24 @@ final class ExoProcessController: ObservableObject {
         }
     }
 
-    /// Fires once when EXO transitions to `.running` for the very first time (fresh install).
-    @Published private(set) var isFirstLaunchReady = false
-
     private var process: Process?
     private var runtimeDirectoryURL: URL?
     private var pendingLaunchTask: Task<Void, Never>?
+    private var logRotationTask: Task<Void, Never>?
+
+    private var readinessTask: Task<Void, Never>?
+    private let readinessProbe: () async -> Bool
+
+    /// `readinessProbe` says whether a started exo is up yet. Until it does,
+    /// the status is `.starting`.
+    init(readinessProbe: @escaping () async -> Bool = { await ExoReadiness.answers() }) {
+        self.readinessProbe = readinessProbe
+    }
+
+    /// Finishes once the exo that was last stopped has exited.
+    private var stoppingTask: Task<Void, Never>?
+    /// A start that is waiting for `stoppingTask`.
+    private var launchAfterStopTask: Task<Void, Never>?
 
     func launchIfNeeded() {
         guard process?.isRunning != true else { return }
@@ -166,8 +172,28 @@ final class ExoProcessController: ObservableObject {
     }
 
     func launch() {
+        guard process?.isRunning != true else { return }
+        // A stopped exo holds the lock on ~/.exo/exo.pid until it has exited,
+        // which can take seconds, and an exo started before then quits at
+        // once ("daemon already running"). So Save & Restart, or switching
+        // exo off and on quickly, waits for the old one, showing Starting….
+        if let stopping = stoppingTask {
+            cancelPendingLaunch()
+            status = .starting
+            lastError = nil
+            launchAfterStopTask?.cancel()
+            launchAfterStopTask = Task { [weak self] in
+                await stopping.value
+                guard let self, !Task.isCancelled else { return }
+                if self.stoppingTask == stopping {
+                    self.stoppingTask = nil
+                }
+                self.launchAfterStopTask = nil
+                self.launch()
+            }
+            return
+        }
         do {
-            guard process?.isRunning != true else { return }
             cancelPendingLaunch()
             status = .starting
             lastError = nil
@@ -185,47 +211,127 @@ final class ExoProcessController: ObservableObject {
             child.currentDirectoryURL = exoHomeURL
             child.environment = makeEnvironment(for: runtimeURL)
 
-            child.standardOutput = FileHandle.nullDevice
-            child.standardError = FileHandle.nullDevice
+            // exo's output goes to the log so a failure can be explained. If
+            // the log can't be opened, exo still runs, without it.
+            let logFile = Self.logFile
+            _ = try? logFile.rotateIfNeeded()
+            let logHandle = try? logFile.openForAppending()
+            defer { try? logHandle?.close() }
+            try? logHandle?.write(
+                contentsOf: Data(
+                    "=== EXO.app \(buildTag()) started exo at \(Date().ISO8601Format()) ===\n".utf8)
+            )
+            let logOffset = logFile.size()
+            child.standardOutput = logHandle ?? FileHandle.nullDevice
+            child.standardError = logHandle ?? FileHandle.nullDevice
 
             child.terminationHandler = { [weak self] proc in
                 Task { @MainActor in
-                    guard let self else { return }
+                    // Ignore an exit reported after exo was started again.
+                    guard let self, self.process === proc else { return }
                     self.process = nil
+                    self.stopLogRotation()
                     switch self.status {
                     case .stopped:
                         break
                     case .failed:
                         break
                     default:
-                        self.status = .failed(
-                            message: "Exited with code \(proc.terminationStatus)"
+                        let reason = ExoExitReason(
+                            terminationReason: proc.terminationReason,
+                            status: proc.terminationStatus,
+                            output: logFile.text(from: logOffset)
                         )
-                        self.lastError = "Process exited with code \(proc.terminationStatus)"
+                        self.status = .failed(message: reason.message)
+                        self.lastError = reason.message
                     }
                 }
             }
 
             try child.run()
             process = child
-            status = .running
-
-            // Show welcome popout on every launch
-            isFirstLaunchReady = true
+            markRunningOnceReady(child)
+            startLogRotation()
         } catch {
             process = nil
-            status = .failed(message: "Launch error")
+            status = .failed(message: "Couldn't start exo: \(error.localizedDescription)")
             lastError = error.localizedDescription
         }
     }
 
+    /// Opens exo's log in Console, or shows it in Finder if Console isn't
+    /// there.
+    func showLogs() {
+        let logURL = Self.logFile.url
+        guard FileManager.default.fileExists(atPath: logURL.path) else {
+            NSWorkspace.shared.activateFileViewerSelecting([Self.exoDirectoryURL])
+            return
+        }
+        guard
+            let console = NSWorkspace.shared.urlForApplication(
+                withBundleIdentifier: "com.apple.Console")
+        else {
+            NSWorkspace.shared.activateFileViewerSelecting([logURL])
+            return
+        }
+        NSWorkspace.shared.open(
+            [logURL], withApplicationAt: console,
+            configuration: NSWorkspace.OpenConfiguration()
+        ) { _, error in
+            if error != nil {
+                DispatchQueue.main.async {
+                    NSWorkspace.shared.activateFileViewerSelecting([logURL])
+                }
+            }
+        }
+    }
+
+    /// Keeps the log to its size limit while exo runs; see `ExoLogFile`.
+    private func startLogRotation() {
+        stopLogRotation()
+        let logFile = Self.logFile
+        let interval = Self.logRotationInterval
+        logRotationTask = Task.detached(priority: .utility) {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: interval)
+                if Task.isCancelled { return }
+                _ = try? logFile.rotateIfNeeded()
+            }
+        }
+    }
+
+    private func stopLogRotation() {
+        logRotationTask?.cancel()
+        logRotationTask = nil
+    }
+
+    /// Stays `.starting` until exo's API answers, so the app doesn't say
+    /// Running while exo is still loading and the dashboard can't be opened.
+    private func markRunningOnceReady(_ child: Process) {
+        readinessTask?.cancel()
+        let probe = readinessProbe
+        readinessTask = Task { [weak self] in
+            let ready = await ExoReadiness.wait(
+                every: .milliseconds(500), while: { child.isRunning }, until: probe)
+            guard ready, let self, self.process === child, self.status == .starting else {
+                return
+            }
+            self.status = .running
+        }
+    }
+
     func stop() {
+        readinessTask?.cancel()
+        readinessTask = nil
+        launchAfterStopTask?.cancel()
+        launchAfterStopTask = nil
         guard let process else {
             status = .stopped
             return
         }
         process.terminationHandler = nil
         status = .stopped
+        stopLogRotation()
 
         guard process.isRunning else {
             self.process = nil
@@ -235,43 +341,37 @@ final class ExoProcessController: ObservableObject {
         let proc = process
         self.process = nil
 
-        Task.detached {
+        stoppingTask = Task.detached {
             proc.interrupt()
-
-            for _ in 0..<50 {
-                if !proc.isRunning { return }
-                try? await Task.sleep(nanoseconds: 100_000_000)
-            }
-
+            if await Self.waitForExit(of: proc, seconds: 5) { return }
             if proc.isRunning {
                 proc.terminate()
             }
-
-            for _ in 0..<30 {
-                if !proc.isRunning { return }
-                try? await Task.sleep(nanoseconds: 100_000_000)
-            }
-
+            if await Self.waitForExit(of: proc, seconds: 3) { return }
             if proc.isRunning {
                 kill(proc.processIdentifier, SIGKILL)
             }
+            _ = await Self.waitForExit(of: proc, seconds: 2)
         }
+    }
+
+    /// Waits up to `seconds` for `process` to exit, and says whether it has.
+    /// Uses a deadline rather than counting sleeps, which take longer than
+    /// asked on a busy Mac.
+    nonisolated static func waitForExit(of process: Process, seconds: Int) async -> Bool {
+        let deadline = ContinuousClock.now + .seconds(seconds)
+        while process.isRunning {
+            if ContinuousClock.now >= deadline {
+                return false
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return true
     }
 
     func restart() {
         stop()
         launch()
-    }
-
-    /// Mark onboarding as completed (user interacted with the welcome popout).
-    func markOnboardingCompleted() {
-        UserDefaults.standard.set(true, forKey: onboardingCompletedKey)
-    }
-
-    /// Reset onboarding so the welcome popout appears on next launch.
-    func resetOnboarding() {
-        UserDefaults.standard.removeObject(forKey: onboardingCompletedKey)
-        isFirstLaunchReady = false
     }
 
     func scheduleLaunch(after seconds: TimeInterval) {
@@ -310,19 +410,6 @@ final class ExoProcessController: ObservableObject {
         NSWorkspace.shared.activateFileViewerSelecting([runtimeDirectoryURL])
     }
 
-    func statusTintColor() -> NSColor {
-        switch status {
-        case .running:
-            return .systemGreen
-        case .starting:
-            return .systemYellow
-        case .failed:
-            return .systemRed
-        case .stopped:
-            return .systemGray
-        }
-    }
-
     private func resolveRuntimeDirectory() throws -> URL {
         let fileManager = FileManager.default
 
@@ -356,8 +443,10 @@ final class ExoProcessController: ObservableObject {
         if !hfToken.isEmpty {
             environment["HF_TOKEN"] = hfToken
         }
-        if !hfEndpoint.isEmpty {
-            environment["HF_ENDPOINT"] = hfEndpoint
+        // Also fixes up a value saved before Settings normalised it.
+        let endpoint = HuggingFaceEndpoint.normalized(hfEndpoint)
+        if !endpoint.isEmpty {
+            environment["HF_ENDPOINT"] = endpoint
         }
         if enableImageModels {
             environment["EXO_ENABLE_IMAGE_MODELS"] = "true"
@@ -406,11 +495,15 @@ final class ExoProcessController: ObservableObject {
 
         // Apply user-defined arbitrary environment variables last so that
         // power users can override any of the typed fields above when
-        // necessary. Empty keys are ignored.
-        for variable in customEnvironmentVariables {
-            let trimmedKey = variable.key.trimmingCharacters(in: .whitespaces)
-            guard !trimmedKey.isEmpty else { continue }
-            environment[trimmedKey] = variable.value
+        // necessary. Empty or invalid names (e.g. stored by an older version)
+        // are never passed to exo.
+        for variable in customEnvironmentVariables where variable.hasInvalidName {
+            Self.logger.warning(
+                "Not passing custom environment variable with invalid name \"\(variable.trimmedKey, privacy: .public)\" to exo"
+            )
+        }
+        for variable in CustomEnvironmentVariable.sanitized(customEnvironmentVariables) {
+            environment[variable.key] = variable.value
         }
 
         return environment

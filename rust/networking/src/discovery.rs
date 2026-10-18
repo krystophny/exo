@@ -1,17 +1,18 @@
 use std::{
+    collections::VecDeque,
     io,
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytemuck::{Pod, Zeroable};
-use log::{debug, trace, warn};
+use log::{debug, info, trace, warn};
 use netwatcher::WatchHandle;
 use parking_lot::Mutex;
 use tokio::{
     net::UdpSocket,
-    time::{Interval, interval},
+    time::{Interval, MissedTickBehavior, interval},
 };
 use zenoh::config::ZenohId;
 
@@ -19,16 +20,36 @@ const GROUP: Ipv6Addr = Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0xe0a1, 0xde89);
 const MAGIC: [u8; 3] = *b"EXO";
 /// Per-interface cap on a single announcement send.
 const SEND_TIMEOUT: Duration = Duration::from_millis(50);
+/// Replies to any of our last few Hellos are accepted. A reply can arrive after the next
+/// Hello has gone out (the peer, or this loop, was busy), and insisting on the latest nonce
+/// meant a slow peer was never discovered.
+const RECENT_NONCES: usize = 8;
+/// How often to repeat the warning while no Hello can be sent at all.
+const BLOCKED_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+/// How often to repeat that an exo with another version or namespace is on the network.
+const OTHER_CLUSTER_NOTICE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// A pause this long (the process was suspended, the machine slept, or the runtime was
+/// starved) may have let peers expire their sessions with us while we still hold ours.
+const STALL_THRESHOLD: Duration = Duration::from_secs(5);
+/// After such a pause we neither answer nor dial peers for this long (zenoh's lease is 10s),
+/// so the stale sessions are closed before new links are made. zenoh adds a new link to a
+/// peer's existing session instead of starting a new one, and when the peer had already
+/// dropped that session it never receives our declarations again: a one-way split.
+const STALL_HOLD_OFF: Duration = Duration::from_secs(12);
 
 pub struct Discovery {
     sock: Arc<UdpSocket>,
     ifaces: Arc<Mutex<Vec<SocketAddrV6>>>,
     namespace: [u8; 8],
-    last_nonce: Mutex<[u8; 8]>,
+    recent_nonces: Mutex<RecentNonces>,
     /// the port of the service we are doing discovery for - transmitted to peers
     listen_port: u16,
     zid: ZenohId,
     tick: Interval,
+    /// When we last warned that no Hello could be sent; `None` while sending works.
+    blocked_since_warning: Mutex<Option<Instant>>,
+    other_cluster_notice: Mutex<OtherClusterNotice>,
+    stall_guard: StallGuard,
     _sync: Mutex<WatchHandle>,
 }
 
@@ -119,10 +140,18 @@ impl Discovery {
             sock,
             namespace,
             ifaces,
-            last_nonce: Mutex::new(rand::random()),
+            recent_nonces: Mutex::new(RecentNonces::default()),
             listen_port,
             zid,
-            tick: interval(Duration::from_secs(1)),
+            tick: {
+                // After a stall, announce once rather than in a burst of missed ticks
+                let mut tick = interval(Duration::from_secs(1));
+                tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                tick
+            },
+            blocked_since_warning: Mutex::new(None),
+            other_cluster_notice: Mutex::new(OtherClusterNotice::default()),
+            stall_guard: StallGuard::default(),
             _sync,
         })
     }
@@ -131,7 +160,16 @@ impl Discovery {
         let mut buf = [0u8; Hello::buf_size() + WhatsUp::buf_size() + 1];
         loop {
             tokio::select! {
-                _ = self.tick.tick() => {
+                // The tick first: after a stall it tells us so before any queued message is handled
+                biased;
+                scheduled = self.tick.tick() => {
+                    let late = scheduled.elapsed();
+                    if self.stall_guard.on_tick(late, Instant::now()) {
+                        warn!(
+                            "this node was unresponsive for {late:.0?}; ignoring peers for \
+                             {STALL_HOLD_OFF:?} so stale sessions close before reconnecting"
+                        );
+                    }
                     self.announce().await?;
                 }
                 res = self.sock.recv_from(&mut buf) => {
@@ -145,11 +183,15 @@ impl Discovery {
     }
 
     async fn respond(
-        &self,
+        &mut self,
         bytes_read: usize,
         addr: SocketAddr,
         buf: &[u8],
     ) -> io::Result<Option<Discovered>> {
+        if self.stall_guard.holding_off(Instant::now()) {
+            trace!("dropped: holding off after a stall");
+            return Ok(None);
+        }
         trace!(
             "raw recv: {bytes_read} bytes from {addr}: {:02x?}",
             &buf[..bytes_read]
@@ -175,12 +217,21 @@ impl Discovery {
                     return Ok(None);
                 }
                 let hello: &Hello = bytemuck::from_bytes(&buf[size_of::<Header>()..total]);
-                if hello.nonce == *self.last_nonce.lock() {
+                if self.recent_nonces.lock().contains(hello.nonce) {
                     trace!("dropped: local hello nonce");
                     return Ok(None);
                 }
                 if hello.namespace != self.namespace {
                     trace!("dropped: different namespace");
+                    if self.other_cluster_notice.lock().due(Instant::now()) {
+                        info!(
+                            "found another exo at {} that can't join this cluster: it runs a \
+                             different version of exo, or was started with a different \
+                             namespace. Nodes connect only when both match, so update every \
+                             device to the same version of exo.",
+                            addr.ip()
+                        );
+                    }
                     return Ok(None);
                 }
 
@@ -193,22 +244,12 @@ impl Discovery {
                 }
                 .alloc();
 
-                for i in 1..6 {
-                    if self
-                        .sock
-                        .send_to(&reply, addr)
-                        .await
-                        .inspect_err(|e| debug!("send to {addr} failed: {e}"))
-                        .is_ok_and(|sent| sent == WhatsUp::buf_size())
-                    {
-                        trace!(
-                            "sent {} bytes to {addr} after {} attempt(s)",
-                            WhatsUp::buf_size(),
-                            i
-                        );
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(300)).await;
+                // One attempt only: retrying here would stall this loop (and with it our own
+                // announcements and every other reply), and the peer says Hello again every
+                // second anyway.
+                match self.sock.send_to(&reply, addr).await {
+                    Ok(sent) => trace!("sent {sent} bytes to {addr}"),
+                    Err(e) => debug!("send to {addr} failed: {e}"),
                 }
                 Ok(None)
             }
@@ -219,7 +260,7 @@ impl Discovery {
                     return Ok(None);
                 }
                 let whats_up: &WhatsUp = bytemuck::from_bytes(&buf[size_of::<Header>()..total]);
-                if whats_up.nonce != *self.last_nonce.lock() {
+                if !self.recent_nonces.lock().contains(whats_up.nonce) {
                     trace!("dropped: stale nonce");
                     return Ok(None);
                 }
@@ -250,7 +291,7 @@ impl Discovery {
 
     async fn announce(&self) -> io::Result<()> {
         let nonce = rand::random();
-        *self.last_nonce.lock() = nonce;
+        self.recent_nonces.lock().push(nonce);
         let buf = Hello {
             nonce,
             namespace: self.namespace,
@@ -259,38 +300,152 @@ impl Discovery {
 
         let addrs = self.ifaces.lock().clone();
         debug!("announcing Hello({nonce:?}) to {addrs:?}");
-        let sref = socket2::SockRef::from(&*self.sock);
-        // rev so .remove() doesn't break things
-        for (i, addr) in addrs.into_iter().enumerate().rev() {
-            // A scope id in the destination is not sufficient to select the
-            // egress interface for IPv6 multicast; IPV6_MULTICAST_IF must be
-            // set per send, otherwise every datagram leaves via the default
-            // multicast interface regardless of the address it was sent to.
-            if let Err(e) = sref.set_multicast_if_v6(addr.scope_id()) {
-                debug!(
-                    "could not set multicast egress iface {}: {e}",
-                    addr.scope_id()
-                );
-                continue;
-            }
-            // Bound each send. Awaiting send_to unbounded lets a single
-            // interface whose transmit queue never drains (a tunnel with no
-            // reader, e.g. utun*) block this task forever - and because next()
-            // is the only driver of announce() AND of recv_from, that silences
-            // discovery for the whole node permanently. Announcements are
-            // periodic and idempotent, so skipping a congested interface for
-            // this tick is the correct trade.
-            match tokio::time::timeout(SEND_TIMEOUT, self.sock.send_to(&buf, addr)).await {
-                Ok(Ok(bytes)) => trace!("sent {bytes} to {addr}"),
-                Ok(Err(e)) if e.kind() == io::ErrorKind::HostUnreachable => {
-                    debug!("disabling discovery address {addr}: {e}");
-                    _ = self.ifaces.lock().swap_remove(i);
+        match send_to_all(&self.sock, &buf, &addrs).await {
+            Ok(()) => {
+                if self.blocked_since_warning.lock().take().is_some() {
+                    info!("peer discovery can send again");
                 }
-                Ok(Err(e)) => debug!("failed to reach {addr}: {e}"),
-                Err(_elapsed) => trace!("timed out sending to {addr}; skipped this tick"),
+            }
+            Err(e) => {
+                let warning_due = {
+                    let mut last_warning = self.blocked_since_warning.lock();
+                    let due =
+                        last_warning.is_none_or(|at| at.elapsed() >= BLOCKED_WARNING_INTERVAL);
+                    if due {
+                        *last_warning = Some(Instant::now());
+                    }
+                    due
+                };
+                if warning_due {
+                    warn!(
+                        "peer discovery could not send on any network interface ({e}), so other \
+                         nodes cannot find this one. On macOS this usually means Local Network \
+                         access is blocked for this process: allow it in System Settings > \
+                         Privacy & Security > Local Network. Background services started \
+                         outside a login session can be denied without a prompt. Retrying \
+                         every second."
+                    );
+                }
             }
         }
         Ok(())
+    }
+}
+
+/// Ignores peers for a while after this process stalled (see `STALL_HOLD_OFF`).
+#[derive(Debug, Default)]
+struct StallGuard {
+    held_off_until: Option<Instant>,
+}
+
+impl StallGuard {
+    /// Called on every tick with how late it fired. Returns whether that was a stall.
+    fn on_tick(&mut self, late: Duration, now: Instant) -> bool {
+        if late < STALL_THRESHOLD {
+            return false;
+        }
+        self.held_off_until = Some(now + STALL_HOLD_OFF);
+        true
+    }
+
+    fn holding_off(&mut self, now: Instant) -> bool {
+        match self.held_off_until {
+            Some(until) if now < until => true,
+            Some(_) => {
+                info!("resuming peer discovery");
+                self.held_off_until = None;
+                false
+            }
+            None => false,
+        }
+    }
+}
+
+/// Rate-limits the notice that an exo of another version or namespace is on the network: a
+/// node sends a Hello every second from each of its interfaces.
+#[derive(Default)]
+struct OtherClusterNotice {
+    last: Option<Instant>,
+}
+
+impl OtherClusterNotice {
+    fn due(&mut self, now: Instant) -> bool {
+        match self.last {
+            Some(last) if now.duration_since(last) < OTHER_CLUSTER_NOTICE_INTERVAL => false,
+            _ => {
+                self.last = Some(now);
+                true
+            }
+        }
+    }
+}
+
+/// Send `buf` to every address, returning an error only if nothing could be sent.
+///
+/// Failed addresses are not dropped: macOS returns EHOSTUNREACH while Local Network access
+/// is denied or its prompt is still pending, and an interface may simply not have a route
+/// yet. Retrying on the next tick lets discovery recover on its own once sending works.
+async fn send_to_all(sock: &UdpSocket, buf: &[u8], addrs: &[SocketAddrV6]) -> io::Result<()> {
+    let sref = socket2::SockRef::from(sock);
+    let mut last_err = None;
+    let mut sent_any = false;
+    for addr in addrs {
+        // A scope id in the destination is not sufficient to select the egress
+        // interface for IPv6 multicast; IPV6_MULTICAST_IF must be set per send,
+        // otherwise every datagram leaves via the default multicast interface
+        // regardless of the address it was sent to.
+        if let Err(e) = sref.set_multicast_if_v6(addr.scope_id()) {
+            debug!(
+                "could not set multicast egress iface {}: {e}",
+                addr.scope_id()
+            );
+            last_err = Some(e);
+            continue;
+        }
+        // Bound each send. Awaiting send_to unbounded lets a single interface
+        // whose transmit queue never drains (a tunnel with no reader, e.g.
+        // utun*) block the announce loop forever - and because next() is the
+        // only driver of announce() AND of recv_from, that silences discovery
+        // for the whole node. Announcements are periodic and idempotent, so
+        // skipping a congested interface for this tick is the correct trade.
+        match tokio::time::timeout(SEND_TIMEOUT, sock.send_to(buf, addr)).await {
+            Ok(Ok(bytes)) => {
+                sent_any = true;
+                trace!("sent {bytes} to {addr}");
+            }
+            Ok(Err(e)) => {
+                debug!("failed to reach {addr}: {e}");
+                last_err = Some(e);
+            }
+            Err(_elapsed) => {
+                trace!("timed out sending to {addr}; skipped this tick");
+                last_err = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("timed out sending to {addr}"),
+                ));
+            }
+        }
+    }
+    match last_err {
+        Some(e) if !sent_any => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// The nonces of our last few Hellos.
+#[derive(Default)]
+struct RecentNonces(VecDeque<[u8; 8]>);
+
+impl RecentNonces {
+    fn push(&mut self, nonce: [u8; 8]) {
+        if self.0.len() == RECENT_NONCES {
+            self.0.pop_front();
+        }
+        self.0.push_back(nonce);
+    }
+
+    fn contains(&self, nonce: [u8; 8]) -> bool {
+        self.0.contains(&nonce)
     }
 }
 
@@ -367,3 +522,105 @@ impl Message for WhatsUp {
     const KIND: Kind = Kind::WhatsUp;
 }
 impl_alloc!(WhatsUp);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_late_tick_holds_off_peers_for_a_while() {
+        let mut guard = StallGuard::default();
+        let start = Instant::now();
+        assert!(!guard.on_tick(Duration::from_millis(1500), start));
+        assert!(!guard.holding_off(start));
+
+        assert!(guard.on_tick(Duration::from_secs(30), start));
+        assert!(guard.holding_off(start));
+        assert!(guard.holding_off(start + STALL_HOLD_OFF.saturating_sub(Duration::from_millis(1))));
+        assert!(!guard.holding_off(start + STALL_HOLD_OFF));
+        assert!(!guard.holding_off(start + STALL_HOLD_OFF * 2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stall_shows_up_as_a_late_tick() {
+        let mut tick = interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        tick.tick().await;
+        // Nothing polls the interval for 30s, as when the process is suspended
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let late = tick.tick().await.elapsed();
+        assert!(late >= STALL_THRESHOLD, "{late:?}");
+        // The next tick is on time again
+        let next_late = tick.tick().await.elapsed();
+        assert!(next_late < STALL_THRESHOLD, "{next_late:?}");
+    }
+
+    #[test]
+    fn says_another_cluster_is_there_once_per_interval() {
+        let mut notice = OtherClusterNotice::default();
+        let start = Instant::now();
+        assert!(notice.due(start));
+        assert!(!notice.due(start + Duration::from_secs(1)));
+        assert!(!notice.due(start + OTHER_CLUSTER_NOTICE_INTERVAL - Duration::from_millis(1)));
+        assert!(notice.due(start + OTHER_CLUSTER_NOTICE_INTERVAL));
+        assert!(!notice.due(start + OTHER_CLUSTER_NOTICE_INTERVAL + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn remembers_only_the_most_recent_nonces() {
+        let mut recent = RecentNonces::default();
+        let nonces: Vec<[u8; 8]> = (0..=RECENT_NONCES as u8).map(|i| [i; 8]).collect();
+        for nonce in &nonces {
+            recent.push(*nonce);
+        }
+        assert!(!recent.contains(nonces[0]));
+        assert!(nonces[1..].iter().all(|nonce| recent.contains(*nonce)));
+    }
+
+    /// An address no packet can be sent to: the discovery group on an interface index that
+    /// doesn't exist.
+    fn unsendable() -> SocketAddrV6 {
+        SocketAddrV6::new(GROUP, 9, 0, u32::MAX)
+    }
+
+    /// A UDP socket on the IPv6 loopback, or `None` where there isn't one (some sandboxes).
+    async fn local_socket() -> Option<(UdpSocket, SocketAddrV6)> {
+        let sock = UdpSocket::bind("[::1]:0").await.ok()?;
+        match sock.local_addr().ok()? {
+            SocketAddr::V6(addr) => Some((sock, addr)),
+            SocketAddr::V4(_) => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn errors_when_nothing_can_be_sent() {
+        let Some((sender, _)) = local_socket().await else {
+            eprintln!("skipping: no IPv6 loopback");
+            return;
+        };
+        assert!(
+            send_to_all(&sender, b"hello", &[unsendable()])
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn one_working_address_is_enough() {
+        let (Some((sender, _)), Some((receiver, receiver_addr))) =
+            (local_socket().await, local_socket().await)
+        else {
+            eprintln!("skipping: no IPv6 loopback");
+            return;
+        };
+        let addrs = [unsendable(), receiver_addr];
+
+        send_to_all(&sender, b"hello", &addrs)
+            .await
+            .expect("send succeeds on the working address");
+
+        let mut buf = [0u8; 5];
+        let (len, _) = receiver.recv_from(&mut buf).await.expect("recv");
+        assert_eq!(&buf[..len], b"hello");
+    }
+}

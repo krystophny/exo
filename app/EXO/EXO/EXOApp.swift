@@ -24,7 +24,7 @@ struct EXOApp: App {
     @StateObject private var settingsWindowController: SettingsWindowController
     @StateObject private var bugReportWindowController: BugReportWindowController
     private let terminationObserver: TerminationObserver
-    private let firstLaunchPopout = FirstLaunchPopout()
+    private let startupDashboardOpener = StartupDashboardOpener()
     private let ciContext = CIContext(options: nil)
 
     init() {
@@ -38,6 +38,7 @@ struct EXOApp: App {
         }
         _controller = StateObject(wrappedValue: controller)
         let service = ClusterStateService()
+        service.resetWhenExoStarts(controller.$status)
         _stateService = StateObject(wrappedValue: service)
         let networkStatus = NetworkStatusService()
         _networkStatusService = StateObject(wrappedValue: networkStatus)
@@ -48,7 +49,7 @@ struct EXOApp: App {
         _thunderboltBridgeService = StateObject(wrappedValue: thunderboltBridge)
         _settingsWindowController = StateObject(wrappedValue: SettingsWindowController())
         _bugReportWindowController = StateObject(wrappedValue: BugReportWindowController())
-        enableLaunchAtLoginIfNeeded()
+        applyLaunchAtLoginDefault()
         // Install LaunchDaemon to disable Thunderbolt Bridge on startup (prevents network loops)
         NetworkSetupHelper.promptAndInstallIfNeeded()
         // Check local network access periodically (warning disappears when user grants permission)
@@ -71,14 +72,11 @@ struct EXOApp: App {
                 .environmentObject(bugReportWindowController)
         } label: {
             menuBarIcon
-                .onReceive(controller.$isFirstLaunchReady) { ready in
-                    if ready {
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-                            self.firstLaunchPopout.onComplete = { [weak controller] in
-                                controller?.markOnboardingCompleted()
-                            }
-                            self.firstLaunchPopout.show()
-                        }
+                // exo's API answering /node_id means it is up and the
+                // dashboard can be opened.
+                .onReceive(stateService.$localNodeId) { nodeId in
+                    if nodeId != nil {
+                        startupDashboardOpener.exoIsUp()
                     }
                 }
         }
@@ -86,15 +84,33 @@ struct EXOApp: App {
     }
 
     private var menuBarIcon: some View {
+        let style = MenuBarIconStyle.showing(controller.status, apiState: stateService.apiState)
         let baseImage = resizedMenuBarIcon(named: "menubar-icon", size: 26)
-        let iconImage: NSImage
-        if controller.status == .stopped, let grey = greyscale(image: baseImage) {
+        var iconImage = baseImage ?? NSImage(named: "menubar-icon") ?? NSImage()
+        if style.isGreyscale, let grey = greyscale(image: baseImage) {
             iconImage = grey
-        } else {
-            iconImage = baseImage ?? NSImage(named: "menubar-icon") ?? NSImage()
+        }
+        if let badge = style.badge {
+            iconImage = badged(iconImage, color: badge.color)
         }
         return Image(nsImage: iconImage)
-            .accessibilityLabel("EXO")
+            .accessibilityLabel(style.accessibilityLabel)
+    }
+
+    /// Draws a coloured dot in the bottom-right corner, in the empty space
+    /// below the wordmark.
+    private func badged(_ image: NSImage, color: NSColor) -> NSImage {
+        let size = image.size
+        let diameter = (size.width * 0.32).rounded()
+        let badgedImage = NSImage(size: size)
+        badgedImage.lockFocus()
+        defer { badgedImage.unlockFocus() }
+        image.draw(in: NSRect(origin: .zero, size: size))
+        color.setFill()
+        NSBezierPath(
+            ovalIn: NSRect(x: size.width - diameter, y: 0, width: diameter, height: diameter)
+        ).fill()
+        return badgedImage
     }
 
     private func resizedMenuBarIcon(named: String, size: CGFloat) -> NSImage? {
@@ -142,13 +158,18 @@ struct EXOApp: App {
         return NSImage(cgImage: rendered, size: image.size)
     }
 
-    private func enableLaunchAtLoginIfNeeded() {
-        guard SMAppService.mainApp.status != .enabled else { return }
-        do {
-            try SMAppService.mainApp.register()
-        } catch {
-            Logger().error(
-                "Failed to register EXO for launch at login: \(error.localizedDescription)")
+    /// Registers a new install as a login item, retrying on later launches
+    /// until it succeeds. Upgrades, and launches after that, leave the login
+    /// item alone so that turning it off (in Settings or in System Settings →
+    /// Login Items) sticks.
+    private func applyLaunchAtLoginDefault() {
+        let preferences = StartupPreferences()
+        let isTranslocated = StartupPreferences.isTranslocated(
+            bundlePath: Bundle.main.bundlePath)
+        guard preferences.shouldRegisterLaunchAtLoginOnStartup(isTranslocated: isTranslocated)
+        else { return }
+        if LaunchAtLoginHelper.enable() {
+            preferences.markLaunchAtLoginDefaultApplied()
         }
     }
 
@@ -158,12 +179,43 @@ struct EXOApp: App {
 enum LaunchAtLoginHelper {
     private static let logger = Logger(subsystem: "io.exo.EXO", category: "LaunchAtLogin")
 
-    /// Unregisters EXO from launching at login
-    static func disable() {
-        guard SMAppService.mainApp.status == .enabled else { return }
-        do {
+    static var status: SMAppService.Status {
+        SMAppService.mainApp.status
+    }
+
+    /// Registers or unregisters EXO as a login item, throwing macOS's error if
+    /// it refuses.
+    static func setEnabled(_ enabled: Bool) throws {
+        let status = SMAppService.mainApp.status
+        if enabled {
+            guard status != .enabled else { return }
+            try SMAppService.mainApp.register()
+            logger.info("Registered EXO for launch at login")
+        } else {
+            guard status == .enabled || status == .requiresApproval else { return }
             try SMAppService.mainApp.unregister()
             logger.info("Unregistered EXO from launch at login")
+        }
+    }
+
+    /// Registers EXO to launch at login. Returns whether it is registered.
+    @discardableResult
+    static func enable() -> Bool {
+        do {
+            try setEnabled(true)
+            return true
+        } catch {
+            logger.error(
+                "Failed to register EXO for launch at login: \(error.localizedDescription, privacy: .public)"
+            )
+            return false
+        }
+    }
+
+    /// Unregisters EXO from launching at login
+    static func disable() {
+        do {
+            try setEnabled(false)
         } catch {
             logger.error(
                 "Failed to unregister EXO from launch at login: \(error.localizedDescription, privacy: .public)"
