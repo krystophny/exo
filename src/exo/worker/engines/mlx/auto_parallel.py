@@ -155,7 +155,7 @@ class PipelineLastLayer(CustomMlxLayer):
         self.is_prefill: bool = False
         self.queue_sends: bool = False
 
-    def __call__(self, x: mx.array, *args: object, **kwargs: object) -> object:
+    def __call__(self, x: mx.array, *args: object, **kwargs: object) -> mx.array:
         cache = self.original_layer_signature.bind_partial(
             x, *args, **kwargs
         ).arguments.get("cache", None)
@@ -200,7 +200,9 @@ class PipelineLastLayer(CustomMlxLayer):
             mx.eval(output)
 
         if extras:
-            return (output, *extras)
+            # nn.Module.__call__ is typed as returning an array, but the wrapped layer
+            # returned a tuple and its caller unpacks one: hand back the same shape.
+            return cast(mx.array, cast(object, (output, *extras)))
         return output
 
 
