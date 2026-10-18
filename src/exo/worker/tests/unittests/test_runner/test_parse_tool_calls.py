@@ -4,6 +4,8 @@ import json
 from collections.abc import Generator
 from typing import Any
 
+from loguru import logger
+
 from exo.shared.types.worker.runner_response import GenerationResponse, ToolCallResponse
 from exo.worker.runner.llm_inference.model_output_parsers import parse_tool_calls
 from exo.worker.runner.llm_inference.tool_parsers import (
@@ -292,3 +294,30 @@ class TestResidualMarkupGuard:
         assert json.loads(results[0].tool_calls[0].arguments) == {
             "snippet": "<div>x</div>"
         }
+
+
+def test_tool_call_logging_never_contains_model_output():
+    """Parsed and rejected tool calls are model output; logs keep shape only."""
+    secret = "SECRET-SENTINEL-4b1e"
+
+    def _secret_parser(text: str) -> dict[str, Any]:
+        markup = "</think><tool_call>" if text.endswith("bad") else ""
+        return {"name": "bash", "arguments": {"command": f"{secret}{markup}"}}
+
+    lines: list[str] = []
+    sink = logger.add(lambda message: lines.append(str(message)), level="DEBUG")
+    try:
+        for body in (f"{secret}-good", f"{secret}-bad"):
+            list(
+                parse_tool_calls(
+                    _make_responses(["<tool_call>", body, "</tool_call>"]),
+                    make_mlx_parser("<tool_call>", "</tool_call>", _secret_parser),
+                    tools=None,
+                )
+            )
+    finally:
+        logger.remove(sink)
+
+    assert any("parsed tool call text" in line for line in lines)
+    assert any("tool call parsing failed" in line for line in lines)
+    assert not any(secret in line for line in lines)

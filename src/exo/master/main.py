@@ -183,7 +183,10 @@ class Master:
         with self.command_receiver as commands:
             async for forwarder_command in commands:
                 try:
-                    logger.info(f"Executing command: {forwarder_command.command}")
+                    # Commands carry prompts; log the type only.
+                    logger.info(
+                        f"Executing command: {type(forwarder_command.command).__name__}"
+                    )
 
                     generated_events: list[Event] = []
                     command = forwarder_command.command

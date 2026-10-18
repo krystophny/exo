@@ -270,7 +270,7 @@ def _parse_dsml_stream(
             return ToolCallResponse(
                 tool_calls=parsed, usage=response.usage, stats=response.stats
             )
-        logger.warning(f"DSML tool call parsing failed for: {text}")
+        logger.warning(f"DSML tool call parsing failed for {len(text)} characters")
         return response.model_copy(update={"text": text})
 
     for response in responses:
@@ -427,9 +427,10 @@ def parse_tool_calls(
         text: str, response: GenerationResponse
     ) -> ToolCallResponse | GenerationResponse:
         parsed = tool_parser.parse(text.strip(), tools=tools)
-        logger.info(f"parsed tool call text into {parsed=}")
+        # Tool arguments and raw text are model output; log shape only.
+        logger.info(f"parsed tool call text into {len(parsed) if parsed else 0} calls")
         if parsed is None or _tool_call_contains_control_markup(parsed):
-            logger.warning(f"tool call parsing failed for text {text}")
+            logger.warning(f"tool call parsing failed for {len(text)} characters")
             return response.model_copy(
                 update={"text": text, "token": 0, "finish_reason": "stop"}
             )

@@ -292,12 +292,12 @@ class RunnerSupervisor:
     async def start_task(self, task: Task):
         if task.task_id in self.pending:
             logger.warning(
-                f"Skipping invalid task {task} as it has already been submitted"
+                f"Skipping invalid task {task.task_id} as it has already been submitted"
             )
             return
         if task.task_id in self.completed or task.task_id in self.cancelled:
             logger.warning(
-                f"Skipping invalid task {task} as it has already been completed"
+                f"Skipping invalid task {task.task_id} as it has already been completed"
             )
             return
         logger.info(
