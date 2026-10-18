@@ -382,8 +382,8 @@ requires-dist = [
     { name = "hypercorn", specifier = ">=0.18.0" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "mflux", marker = "extra == 'mlx'", git = "https://github.com/evanev7/mflux?branch=exo2" },
-    { name = "mlx", marker = "sys_platform == 'darwin' and extra == 'mlx'", git = "https://github.com/krystophny/mlx-jaccl-fix-small-recv?rev=1d4368eb7006be8104c11950ade3ae835fe65396" },
-    { name = "mlx-lm", marker = "extra == 'mlx'", git = "https://github.com/krystophny/mlx-lm?rev=399f6dfeb32e4ad9613527d75cd2403dcb08cc99" },
+    { name = "mlx", marker = "sys_platform == 'darwin' and extra == 'mlx'", git = "https://github.com/krystophny/mlx-jaccl-fix-small-recv?rev=3c8a51df8572bd3da16ed7d3d1edba8fb5a9abe5" },
+    { name = "mlx-lm", marker = "extra == 'mlx'", git = "https://github.com/krystophny/mlx-lm?rev=4dd69f27014f46724bcf1235be4d9db12cd2bb75" },
     { name = "mlx-vlm", marker = "extra == 'mlx'", specifier = ">=0.3.11" },
     { name = "msgspec", specifier = ">=0.19.0" },
     { name = "nanobind", marker = "extra == 'build'" },
@@ -1069,8 +1069,8 @@ wheels = [
 
 [[package]]
 name = "mlx"
-version = "0.32.3.dev20260927+1d4368eb"
-source = { git = "https://github.com/krystophny/mlx-jaccl-fix-small-recv?rev=1d4368eb7006be8104c11950ade3ae835fe65396#1d4368eb7006be8104c11950ade3ae835fe65396" }
+version = "0.32.5.dev20261018+3c8a51df"
+source = { git = "https://github.com/krystophny/mlx-jaccl-fix-small-recv?rev=3c8a51df8572bd3da16ed7d3d1edba8fb5a9abe5#3c8a51df8572bd3da16ed7d3d1edba8fb5a9abe5" }
 
 [[package]]
 name = "mlx-audio"
@@ -1093,8 +1093,8 @@ wheels = [
 
 [[package]]
 name = "mlx-lm"
-version = "0.31.2.dev176+g399f6dfeb"
-source = { git = "https://github.com/krystophny/mlx-lm?rev=399f6dfeb32e4ad9613527d75cd2403dcb08cc99#399f6dfeb32e4ad9613527d75cd2403dcb08cc99" }
+version = "0.31.2.dev199+g4dd69f270"
+source = { git = "https://github.com/krystophny/mlx-lm?rev=4dd69f27014f46724bcf1235be4d9db12cd2bb75#4dd69f27014f46724bcf1235be4d9db12cd2bb75" }
 dependencies = [
     { name = "jinja2" },
     { name = "mlx" },
