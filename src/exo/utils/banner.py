@@ -53,7 +53,9 @@ def print_startup_banner(port: int) -> None:
     if first_run:
         # Skip browser open when running inside the native macOS app —
         # FirstLaunchPopout.swift handles the auto-open with a countdown.
-        if not os.environ.get("EXO_RUNTIME_DIR"):
+        # Headless runs (launchd, ssh, CI) have no browser to open; on macOS
+        # the attempt blocks for minutes until its AppleEvent times out.
+        if not os.environ.get("EXO_RUNTIME_DIR") and sys.stderr.isatty():
             try:
                 webbrowser.open(dashboard_url)
                 logger.info("First run detected — opening dashboard in browser")

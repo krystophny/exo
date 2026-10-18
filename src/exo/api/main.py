@@ -2056,7 +2056,8 @@ class API:
                     break
                 except httpx.TransportError:
                     await anyio.sleep(0.05)
-        print_startup_banner(self.port)
+        # Opening a browser can block; keep it off the event loop serving requests.
+        await to_thread.run_sync(print_startup_banner, self.port)
 
     async def _apply_state(self):
         with self.event_receiver as events:
