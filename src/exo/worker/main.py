@@ -436,6 +436,8 @@ class Worker:
                     try:
                         with fail_after(3):
                             await runner.start_task(task)
+                        with anyio.move_on_after(15):
+                            await runner.wait_runner_shut_down()
                     except TimeoutError:
                         await self.event_sender.send(
                             TaskStatusUpdated(

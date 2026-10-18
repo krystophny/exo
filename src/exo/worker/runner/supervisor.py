@@ -40,6 +40,7 @@ from exo.shared.types.worker.runners import (
     RunnerIdle,
     RunnerLoading,
     RunnerRunning,
+    RunnerShutdown,
     RunnerShuttingDown,
     RunnerStatus,
     RunnerWarmingUp,
@@ -208,6 +209,8 @@ class RunnerSupervisor:
         default_factory=anyio.CancelScope, init=False
     )
     _stopped: anyio.Event = field(default_factory=anyio.Event, init=False)
+    # Set once the runner's final RunnerShutdown status has been forwarded
+    _runner_shut_down: anyio.Event = field(default_factory=anyio.Event, init=False)
 
     @classmethod
     async def create(
@@ -289,6 +292,13 @@ class RunnerSupervisor:
 
     def shutdown(self):
         self._tg.cancel_tasks()
+
+    async def wait_runner_shut_down(self) -> None:
+        """Wait until the runner has reported its own graceful shutdown, or its
+        event stream has ended. A Shutdown task is acknowledged before the runner
+        releases its model, so tearing the supervisor down on acknowledgement
+        alone drops the runner's final Complete and RunnerShutdown events."""
+        await self._runner_shut_down.wait()
 
     async def wait_stopped(self) -> None:
         """Wait until run() has fully finished, including the OS process
@@ -420,12 +430,17 @@ class RunnerSupervisor:
                         self.in_progress.pop(event.task_id, None)
                         self.completed.add(event.task_id)
                     await self._event_sender.send(event)
+                    if isinstance(event, RunnerStatusUpdated) and isinstance(
+                        event.runner_status, RunnerShutdown
+                    ):
+                        self._runner_shut_down.set()
         except (ClosedResourceError, BrokenResourceError):
             # this is the happy path shutdown - we don't need to spam log with it
             await self._check_runner()
         finally:
             for tid in list(self.pending):
                 self.pending[tid].set()
+            self._runner_shut_down.set()
 
     async def _report_terminated(self, task_id: TaskId) -> None:
         self.in_progress.pop(task_id, None)

@@ -14,16 +14,23 @@ from exo.shared.types.events import (
     Event,
     RunnerStatusUpdated,
     TaskAcknowledged,
+    TaskStatusUpdated,
     TaskTerminated,
 )
-from exo.shared.types.tasks import Task, TaskId, TextGeneration
+from exo.shared.types.tasks import Shutdown, Task, TaskId, TaskStatus, TextGeneration
 from exo.shared.types.text_generation import (
     InputMessage,
     InputMessageContent,
     TextGenerationTaskParams,
 )
 from exo.shared.types.worker.instances import BoundInstance, InstanceId
-from exo.shared.types.worker.runners import RunnerFailed, RunnerId, RunnerRunning
+from exo.shared.types.worker.runners import (
+    RunnerFailed,
+    RunnerId,
+    RunnerRunning,
+    RunnerShutdown,
+    RunnerShuttingDown,
+)
 from exo.utils.async_process import AsyncProcess
 from exo.utils.channels import Receiver, Sender, channel, mp_channel
 from exo.worker.runner.bootstrap import RunnerTerminationError
@@ -540,4 +547,67 @@ async def test_cancel_queued_task_waits_for_runner_admission() -> None:
         await supervisor.start_task(never_started)
         assert not task_receiver.collect()
         assert never_started.task_id not in supervisor.pending
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_shutdown_waits_for_the_runners_final_events() -> None:
+    """A Shutdown is acknowledged before the runner releases its model; the
+    supervisor reports shut-down only after forwarding the runner's last events."""
+    event_sender, event_receiver = channel[Event]()
+    task_sender, _task_receiver = mp_channel[Task]()
+    cancel_sender, _cancel_receiver = mp_channel[TaskId]()
+    runner_events, ev_recv = mp_channel[Event | RunnerTerminationError]()
+    bound = get_bound_mlx_ring_instance(
+        InstanceId("instance-a"),
+        ModelId("mlx-community/Llama-3.2-1B-Instruct-4bit"),
+        RunnerId("runner-a"),
+        NodeId("node-a"),
+    )
+    proc = cast(AsyncProcess, cast(object, _DeadProcess()))
+    handler = await RunnerStdioHandler.create(
+        stdout_rx=proc.stdout, stderr_rx=proc.stderr
+    )
+    supervisor = RunnerSupervisor(
+        bound_instance=bound,
+        shard_metadata=bound.bound_shard,
+        runner_process=proc,
+        _runner_stdio_handler=handler,
+        initialize_timeout=400,
+        _ev_recv=ev_recv,
+        _task_sender=task_sender,
+        _cancel_sender=cancel_sender,
+        _event_sender=event_sender,
+    )
+    shutdown = Shutdown(
+        instance_id=bound.instance.instance_id, runner_id=bound.bound_runner_id
+    )
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(supervisor._forward_events)  # pyright: ignore[reportPrivateUsage]
+        runner_events.send(
+            RunnerStatusUpdated(
+                runner_id=bound.bound_runner_id, runner_status=RunnerShuttingDown()
+            )
+        )
+        runner_events.send(TaskAcknowledged(task_id=shutdown.task_id))
+        with anyio.move_on_after(0.2) as early:
+            await supervisor.wait_runner_shut_down()
+        assert early.cancelled_caught
+        runner_events.send(
+            TaskStatusUpdated(task_id=shutdown.task_id, task_status=TaskStatus.Complete)
+        )
+        runner_events.send(
+            RunnerStatusUpdated(
+                runner_id=bound.bound_runner_id, runner_status=RunnerShutdown()
+            )
+        )
+        with anyio.fail_after(2):
+            await supervisor.wait_runner_shut_down()
+        forwarded = event_receiver.collect()
+        assert any(
+            isinstance(e, TaskStatusUpdated) and e.task_status == TaskStatus.Complete
+            for e in forwarded
+        )
+        assert isinstance(forwarded[-1], RunnerStatusUpdated)
+        assert isinstance(forwarded[-1].runner_status, RunnerShutdown)
         tg.cancel_scope.cancel()
