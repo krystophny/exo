@@ -1,7 +1,7 @@
 """A request's images travel with it, and nodes keep them only while that request needs them."""
 
 import hashlib
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 
 import anyio
@@ -94,7 +94,7 @@ async def wait_until(condition: Callable[[], bool]) -> None:
 @asynccontextmanager
 async def worker_on_node_a(
     state: State, *loops: Callable[[Worker], Callable[[], object]]
-) -> AsyncIterator[tuple[Worker, Sender[IndexedEvent], Receiver[Event]]]:
+) -> AsyncGenerator[tuple[Worker, Sender[IndexedEvent], Receiver[Event]]]:
     event_send, event_recv = channel[Event]()
     index_send, index_recv = channel[IndexedEvent]()
     command_send, _commands = channel[ForwarderCommand]()

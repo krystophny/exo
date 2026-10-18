@@ -1,6 +1,6 @@
 """The worker isn't held up waiting for a busy runner to acknowledge a generation task."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import cast
 
@@ -54,7 +54,7 @@ class _SilentProcess:
 
 
 @asynccontextmanager
-async def supervisor() -> AsyncIterator[tuple[RunnerSupervisor, MpReceiver[Task]]]:
+async def supervisor() -> AsyncGenerator[tuple[RunnerSupervisor, MpReceiver[Task]]]:
     event_sender, _ = channel[Event]()
     task_sender, task_receiver = mp_channel[Task]()
     cancel_sender, cancel_receiver = mp_channel[TaskId]()

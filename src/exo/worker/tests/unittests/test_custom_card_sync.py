@@ -1,6 +1,6 @@
 """Custom model cards saved on a node outlive the cluster state they came from."""
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -73,7 +73,7 @@ class Node:
 
 
 @asynccontextmanager
-async def running_node() -> AsyncIterator[Node]:
+async def running_node() -> AsyncGenerator[Node]:
     event_send, _event_recv = channel[Event]()
     _index_send, index_recv = channel[IndexedEvent]()
     command_send, command_recv = channel[ForwarderCommand]()

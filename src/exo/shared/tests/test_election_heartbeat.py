@@ -1,7 +1,7 @@
 """A master re-announces itself so nodes that ended up following a different master
 (their election missed its messages) re-run the election instead of staying split."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from itertools import pairwise
@@ -67,7 +67,7 @@ class Harness:
 
 
 @asynccontextmanager
-async def running_election() -> AsyncIterator[Harness]:
+async def running_election() -> AsyncGenerator[Harness]:
     em_out_tx, em_out_rx = channel[ElectionMessage]()
     em_in_tx, em_in_rx = channel[ElectionMessage]()
     er_tx, er_rx = channel[ElectionResult]()

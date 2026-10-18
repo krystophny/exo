@@ -1,6 +1,6 @@
 """A chat request whose command never reaches the master is sent again, then ends with an error."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 import anyio
@@ -50,7 +50,7 @@ def chat_request() -> TextGeneration:
 
 
 @asynccontextmanager
-async def running_api() -> AsyncIterator[tuple[API, Receiver[ForwarderCommand]]]:
+async def running_api() -> AsyncGenerator[tuple[API, Receiver[ForwarderCommand]]]:
     api = object.__new__(API)
     api.paused = False
     api._system_id = SystemId()  # pyright: ignore[reportPrivateUsage]

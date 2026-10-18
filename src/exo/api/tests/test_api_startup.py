@@ -5,7 +5,7 @@ import os
 import socket
 import subprocess
 import sys
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import cast
@@ -25,7 +25,7 @@ def bound_port(bound_socket: socket.socket) -> int:
 
 
 @contextmanager
-def port_in_use() -> Iterator[int]:
+def port_in_use() -> Generator[int]:
     """A free port, taken by another listener for the duration."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as other_listener:
         other_listener.bind(("0.0.0.0", 0))
@@ -79,7 +79,7 @@ async def test_the_banner_is_printed_once_the_api_answers(
     events: list[str] = []
 
     @asynccontextmanager
-    async def slow_startup(_app: FastAPI) -> AsyncIterator[None]:
+    async def slow_startup(_app: FastAPI) -> AsyncGenerator[None]:
         await anyio.sleep(0.3)
         events.append("serving")
         yield

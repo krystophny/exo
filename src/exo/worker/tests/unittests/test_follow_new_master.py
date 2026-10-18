@@ -1,6 +1,6 @@
 """A worker keeps its runners when the master changes, and catches the new master up."""
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 
 import anyio
@@ -79,7 +79,7 @@ def with_runner(
 @asynccontextmanager
 async def running_worker(
     state: State, *loops: Callable[[Worker], Callable[[], object]]
-) -> AsyncIterator[
+) -> AsyncGenerator[
     tuple[Worker, Sender[IndexedEvent | StateSnapshot], Receiver[Event]]
 ]:
     event_send, event_recv = channel[Event]()

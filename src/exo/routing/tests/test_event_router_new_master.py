@@ -1,6 +1,6 @@
 """A node follows a new master without tearing down its event router or its consumers."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -64,7 +64,7 @@ class Harness:
 
 
 @asynccontextmanager
-async def running_router() -> AsyncIterator[Harness]:
+async def running_router() -> AsyncGenerator[Harness]:
     command_send, command_recv = channel[ForwarderCommand]()
     events_send, events_recv = channel[GlobalForwarderEvent]()
     outbound_send, outbound_recv = channel[LocalForwarderEvent]()

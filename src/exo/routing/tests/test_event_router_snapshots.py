@@ -1,6 +1,6 @@
 """A node that fell too far behind catches up from a state snapshot sent by the master."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -67,7 +67,7 @@ class Harness:
 
 
 @asynccontextmanager
-async def running_router() -> AsyncIterator[Harness]:
+async def running_router() -> AsyncGenerator[Harness]:
     command_send, command_recv = channel[ForwarderCommand]()
     events_send, events_recv = channel[GlobalForwarderEvent]()
     outbound_send, _outbound_recv = channel[LocalForwarderEvent]()

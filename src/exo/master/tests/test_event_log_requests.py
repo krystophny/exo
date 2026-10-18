@@ -1,7 +1,7 @@
 """The master replays recent events to nodes that missed a few, and sends a state
 snapshot to nodes too far behind to replay."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from unittest.mock import patch
@@ -51,7 +51,7 @@ class Harness:
 @asynccontextmanager
 async def running_master(
     events: list[Event] | None = None, image_bytes: int = 1 << 30
-) -> AsyncIterator[Harness]:
+) -> AsyncGenerator[Harness]:
     events = events if events is not None else [TestEvent() for _ in range(N_EVENTS)]
     node_id = get_node_zid()
     session = SessionId(master_node_id=node_id, election_clock=0)
