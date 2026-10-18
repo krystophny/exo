@@ -148,6 +148,9 @@ _NOT_PENDING = (
 )
 
 
+_DEEPSEEK_V41_OUTPUT_GROUPS = 8
+
+
 def _shard_bytes(shard: ShardMetadata) -> int:
     """The memory a runner needs for its shard of the model."""
     storage = shard.model_card.storage_size.in_bytes
@@ -155,7 +158,7 @@ def _shard_bytes(shard: ShardMetadata) -> int:
         return storage // shard.world_size
     if shard.n_layers == 0:
         return storage
-    return storage * (shard.end_layer - shard.start_layer) // shard.n_layers
+    return shard.model_card.shard_storage_bytes(shard.start_layer, shard.end_layer)
 
 
 def memory_once_loaded(
@@ -243,11 +246,14 @@ def place_instance(
         # KV heads, so the kv-head divisibility check doesn't apply.
         is_deepseek_v4 = command.model_card.base_model.startswith("DeepSeek V4")
         kv_heads = command.model_card.num_key_value_heads
+        # mlx-lm's V4.1 shard() keeps whole output groups per rank: 8 groups.
+        is_deepseek_v41 = command.model_card.base_model.startswith("DeepSeek V4.1")
         cycles_with_sufficient_memory = [
             cycle
             for cycle in cycles_with_sufficient_memory
             if command.model_card.hidden_size % len(cycle) == 0
             and (is_deepseek_v4 or kv_heads is None or kv_heads % len(cycle) == 0)
+            and (not is_deepseek_v41 or _DEEPSEEK_V41_OUTPUT_GROUPS % len(cycle) == 0)
         ]
         if not cycles_with_sufficient_memory:
             raise ValueError(

@@ -26,6 +26,7 @@ except ImportError:
 
 from mlx_lm.models.cache import KVCache
 from mlx_lm.models.deepseek_v3 import DeepseekV3Model
+from mlx_lm.models.deepseek_v41 import Model as DeepseekV41Model
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.models.model_cards import ModelId
@@ -72,6 +73,13 @@ from exo.worker.runner.bootstrap import logger
 
 
 def get_weights_size(model_shard_meta: ShardMetadata) -> Memory:
+    card = model_shard_meta.model_card
+    if card.extra_layer_storage and isinstance(model_shard_meta, PipelineShardMetadata):
+        return Memory.from_bytes(
+            card.shard_storage_bytes(
+                model_shard_meta.start_layer, model_shard_meta.end_layer
+            )
+        )
     return Memory.from_float_kb(
         (model_shard_meta.end_layer - model_shard_meta.start_layer)
         / model_shard_meta.n_layers
@@ -200,6 +208,7 @@ def load_mlx_items(
         end_time = time.perf_counter()
         logger.info(f"Time taken to load model: {(end_time - start_time):.2f}s")
         tokenizer = get_tokenizer(model_path, bound_instance.bound_shard)
+        attach_tokenizer(model, tokenizer)
 
     else:
         logger.info("Starting distributed init")
@@ -238,6 +247,13 @@ def load_mlx_items(
         vision_processor = None
 
     return cast(Model, model), tokenizer, vision_processor
+
+
+def attach_tokenizer(model: nn.Module, tokenizer: TokenizerWrapper) -> None:
+    """DeepSeek V4.1's Engram layers hash n-grams of tokenizer-normalised ids,
+    so the model needs the tokenizer before its first forward pass."""
+    if isinstance(model, DeepseekV41Model):
+        model.attach_tokenizer(tokenizer)
 
 
 def shard_and_load(
@@ -279,6 +295,7 @@ def shard_and_load(
     assert isinstance(model, nn.Module)
 
     tokenizer = get_tokenizer(model_path, shard_metadata)
+    attach_tokenizer(model, tokenizer)
 
     logger.info(f"Group size: {group.size()}, group rank: {group.rank()}")
 
@@ -512,6 +529,22 @@ def _needs_v4_encoding(task_params: TextGenerationTaskParams) -> bool:
     return "deepseek-v4" in task_params.model.lower()
 
 
+def _needs_v41_encoding(task_params: TextGenerationTaskParams) -> bool:
+    return "deepseek-v4.1" in task_params.model.lower()
+
+
+def _v41_reasoning_effort(task_params: TextGenerationTaskParams) -> str | None:
+    """V4.1 takes low/high/max (budgets 50/75/100) and defaults to high."""
+    effort = task_params.reasoning_effort
+    if effort in ("xhigh", "max"):
+        return "max"
+    if effort in ("minimal", "low"):
+        return "low"
+    if effort == "high":
+        return "high"
+    return None
+
+
 def _v4_reasoning_effort(task_params: TextGenerationTaskParams) -> str | None:
     effort = task_params.reasoning_effort
     if effort in ("xhigh", "max"):
@@ -592,6 +625,43 @@ def render_chat_template(
             if task_params.enable_thinking is False
             else "thinking",
             tools=task_params.tools,
+        )
+        if partial_assistant_content:
+            prompt += partial_assistant_content
+        return prompt
+
+    if _needs_v41_encoding(task_params):
+        from exo.worker.engines.mlx.vendor.deepseek_v41_encoding import (
+            encode_messages as encode_messages_v41,
+        )
+
+        v41_messages = [dict(m) for m in formatted_messages]
+        for msg in v41_messages:
+            if msg.get("role") == "developer":
+                # V4.1 has no developer role; its system token serves both.
+                msg["role"] = "system"
+            if msg.get("role") == "assistant":
+                content = msg.get("content")
+                if isinstance(content, str):
+                    msg["content"] = _strip_v4_thinking_markers(content)
+        if task_params.tools:
+            for msg in v41_messages:
+                if msg.get("role") == "system":
+                    msg["tools"] = task_params.tools
+                    break
+            else:
+                v41_messages.insert(
+                    0, {"role": "system", "content": "", "tools": task_params.tools}
+                )
+        prompt = cast(
+            str,
+            encode_messages_v41(
+                messages=v41_messages,
+                thinking_mode="chat"
+                if task_params.enable_thinking is False
+                else "thinking",
+                reasoning_effort=_v41_reasoning_effort(task_params),
+            ),
         )
         if partial_assistant_content:
             prompt += partial_assistant_content

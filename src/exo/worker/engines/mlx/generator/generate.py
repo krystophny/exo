@@ -12,6 +12,7 @@ from mlx_lm.generate import (
     maybe_quantize_kv_cache,
     stream_generate,
 )
+from mlx_lm.models.deepseek_v41 import LayerCache as DeepseekV41Cache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
@@ -392,6 +393,7 @@ def prefill(
                 cache[i] = restored  # type: ignore
         else:
             assert not non_trimmable
+            assert not isinstance(c, DeepseekV41Cache)
             c.trim(2)
 
     elapsed = time.perf_counter() - start_time

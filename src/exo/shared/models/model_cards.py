@@ -12,6 +12,7 @@ from pydantic import (
     AliasChoices,
     BaseModel,
     Field,
+    NonNegativeInt,
     PositiveInt,
     ValidationError,
     ValidationInfo,
@@ -159,6 +160,14 @@ class SamplingDefaults(SamplingValues):
     non_thinking: SamplingValues | None = None
 
 
+class LayerStorage(FrozenModel):
+    """Bytes a layer holds on top of its even share of the model, such as an
+    n-gram lookup table that only one layer owns."""
+
+    layer: NonNegativeInt
+    storage_size: Memory
+
+
 class ModelCard(FrozenModel):
     model_id: ModelId
     storage_size: Memory
@@ -180,6 +189,45 @@ class ModelCard(FrozenModel):
     is_custom: bool = False
     vision: VisionCardConfig | None = None
     sampling_defaults: SamplingDefaults = Field(default_factory=SamplingDefaults)
+    # Layers far heavier than the rest; pipeline placement weighs them.
+    extra_layer_storage: list[LayerStorage] = []
+    # The model runs its own pipeline, in which the last rank holds the first
+    # layers (mlx-lm's PipelineMixin order), so placement must hand out the
+    # layer ranges from the last rank backwards.
+    pipeline_layers_reversed: bool = False
+
+    @model_validator(mode="after")
+    def _check_extra_layer_storage(self) -> "ModelCard":
+        layers = [entry.layer for entry in self.extra_layer_storage]
+        if len(set(layers)) != len(layers):
+            raise ValueError(f"extra_layer_storage names a layer twice: {layers}")
+        if any(layer >= self.n_layers for layer in layers):
+            raise ValueError(
+                f"extra_layer_storage names a layer outside the {self.n_layers} layers"
+            )
+        extra = sum(entry.storage_size.in_bytes for entry in self.extra_layer_storage)
+        if self.extra_layer_storage and extra >= self.storage_size.in_bytes:
+            raise ValueError("extra_layer_storage exceeds the model's storage_size")
+        return self
+
+    def layer_storage_bytes(self) -> list[int]:
+        """The bytes each layer holds: an even share of what the heavy layers
+        leave, plus the heavy layers' own extra."""
+        extra = {
+            entry.layer: entry.storage_size.in_bytes
+            for entry in self.extra_layer_storage
+        }
+        rest = self.storage_size.in_bytes - sum(extra.values())
+        n = self.n_layers
+        return [rest * (i + 1) // n - rest * i // n + extra.get(i, 0) for i in range(n)]
+
+    def shard_storage_bytes(self, start_layer: int, end_layer: int) -> int:
+        """The bytes the layers [start_layer, end_layer) hold."""
+        if not self.extra_layer_storage:
+            return (
+                self.storage_size.in_bytes * (end_layer - start_layer) // self.n_layers
+            )
+        return sum(self.layer_storage_bytes()[start_layer:end_layer])
 
     @model_validator(mode="after")
     def _autodetect_vision(self) -> "ModelCard":
@@ -255,6 +303,7 @@ class ModelCard(FrozenModel):
             n_layers=num_layers,
             hidden_size=config_data.hidden_size or 0,
             supports_tensor=config_data.supports_tensor,
+            pipeline_layers_reversed=config_data.pipeline_layers_reversed,
             num_key_value_heads=config_data.num_key_value_heads,
             context_length=config_data.max_position_embeddings,
             tasks=[ModelTask.TextGeneration],
@@ -265,6 +314,11 @@ class ModelCard(FrozenModel):
                 Backend
             ),  # all backends — we don't know what an arbitrary HF model supports; let placement gate decide
         )
+
+
+# Checkpoints that ship a vision tower exo has no encoder for: they run as text
+# models (mlx-lm's deepseek_v41 drops the vision weights on load).
+_TEXT_ONLY_MODEL_TYPES = frozenset({"deepseek_v41"})
 
 
 class ConfigData(BaseModel):
@@ -291,6 +345,7 @@ class ConfigData(BaseModel):
         return self.architectures in [
             ["Glm4MoeLiteForCausalLM"],
             ["GlmMoeDsaForCausalLM"],
+            ["DeepseekV41ForCausalLM"],
             ["DeepseekV4ForCausalLM"],
             ["DeepseekV32ForCausalLM"],
             ["DeepseekV3ForCausalLM"],
@@ -306,6 +361,12 @@ class ConfigData(BaseModel):
             ["NemotronHForCausalLM"],
             ["Gemma4ForConditionalGeneration"],
         ]
+
+    @property
+    def pipeline_layers_reversed(self) -> bool:
+        # DeepSeek V4.1 passes cross-layer state between pipeline stages, so exo
+        # runs mlx-lm's own pipeline for it, which orders the ranks backwards.
+        return self.architectures == ["DeepseekV41ForCausalLM"]
 
     @model_validator(mode="before")
     @classmethod
@@ -329,7 +390,11 @@ class ConfigData(BaseModel):
 
         vision_config = data.get("vision_config")
         image_token_id = data.get("image_token_id")
-        if vision_config is not None and image_token_id is not None:
+        if (
+            vision_config is not None
+            and image_token_id is not None
+            and data.get("model_type") not in _TEXT_ONLY_MODEL_TYPES
+        ):
             model_type = str(
                 data.get("model_type", vision_config.get("model_type", ""))  # pyright: ignore[reportAny]
             )

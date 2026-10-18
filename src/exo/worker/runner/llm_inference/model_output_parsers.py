@@ -4,6 +4,7 @@ from typing import Any
 
 from mlx_lm.models.deepseek_v4 import Model as DeepseekV4Model
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
+from mlx_lm.models.deepseek_v41 import Model as DeepseekV41Model
 from mlx_lm.models.gpt_oss import Model as GptOssModel
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 from openai_harmony import (  # pyright: ignore[reportMissingTypeStubs]
@@ -87,6 +88,15 @@ def apply_all_parsers(
                 starts_in_thinking=detect_thinking_prompt_suffix(prompt, tokenizer),
             )
         generator = parse_deepseek_v32(generator)
+    elif issubclass(model_type, DeepseekV41Model) and "deepseek" in normalized_id:
+        if tokenizer.has_thinking:
+            generator = parse_thinking_models(
+                generator,
+                tokenizer.think_start,
+                tokenizer.think_end,
+                starts_in_thinking=detect_thinking_prompt_suffix(prompt, tokenizer),
+            )
+        generator = parse_deepseek_v41(generator)
     elif issubclass(model_type, DeepseekV4Model) and "deepseek-v4" in normalized_id:
         if tokenizer.has_thinking:
             generator = parse_thinking_models(
@@ -246,6 +256,16 @@ def parse_deepseek_v4(
     dsml_token = "｜DSML｜"
     start = f"<{dsml_token}tool_calls>"
     end = f"</{dsml_token}tool_calls>"
+    return _parse_dsml_stream(responses, start, end, parse_dsml_output)
+
+
+def parse_deepseek_v41(
+    responses: Generator[GenerationResponse | None],
+) -> Generator[GenerationResponse | ToolCallResponse | None]:
+    """V4.1 DSML: `<｜DSML｜ calls>` blocks with space-led tag names."""
+    dsml_token = "｜DSML｜"
+    start = f"<{dsml_token} calls>"
+    end = f"</{dsml_token} calls>"
     return _parse_dsml_stream(responses, start, end, parse_dsml_output)
 
 

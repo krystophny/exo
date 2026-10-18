@@ -67,7 +67,7 @@ members = ["rust/exo_rs", "bench", "tools"]
 [tool.uv.sources]
 exo-rs = { workspace = true }
 mlx = { git = "https://github.com/krystophny/mlx-jaccl-fix-small-recv", rev = "3c8a51df8572bd3da16ed7d3d1edba8fb5a9abe5" }
-mlx-lm = { git = "https://github.com/krystophny/mlx-lm", rev = "4dd69f27014f46724bcf1235be4d9db12cd2bb75" }
+mlx-lm = { git = "https://github.com/krystophny/mlx-lm", rev = "7b1f4b3da7259bebd747efda4d6b1ffd7a1a1733" }
 mflux = { git = "https://github.com/evanev7/mflux", branch = "exo2" }
 [build-system]
 requires = ["uv_build>=0.8.9,<0.9.0"]
@@ -175,7 +175,13 @@ torchaudio = ["torch"]
 ###
 
 [tool.ruff]
-extend-exclude = [".typings/**", "rust/exo_rs/**", "bench/vendor/**"]
+# The V4.1 encoder stays as DeepSeek wrote it (only a header added), for its golden tests.
+extend-exclude = [
+  ".typings/**",
+  "rust/exo_rs/**",
+  "bench/vendor/**",
+  "src/exo/worker/engines/mlx/vendor/deepseek_v41_encoding.py",
+]
 
 [tool.ruff.lint]
 extend-select = ["I", "N", "B", "A", "PIE", "SIM"]

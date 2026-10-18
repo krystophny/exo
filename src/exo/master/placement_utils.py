@@ -93,24 +93,90 @@ def _compute_total_memory(
     return total_memory
 
 
+def allocate_layers_by_storage(
+    layer_bytes: list[int],
+    node_bytes: list[int],
+) -> list[int]:
+    """Split the layers, in order, into one contiguous run per node.
+
+    Picks the split that keeps the fullest node, measured as the share of its
+    memory the run takes, as empty as possible. Unlike the proportional split
+    this accounts for layers of very different size.
+    """
+    n_nodes, n_layers = len(node_bytes), len(layer_bytes)
+    if n_nodes == 0:
+        raise ValueError("Cannot allocate layers to an empty node list")
+    if n_layers < n_nodes:
+        raise ValueError(
+            f"Cannot distribute {n_layers} layers across {n_nodes} nodes "
+            "(need at least 1 layer per node)"
+        )
+    if any(memory <= 0 for memory in node_bytes):
+        raise ValueError("Every node needs available memory to hold a layer")
+
+    def split_at(ratio: float) -> list[int] | None:
+        """Fill each node as far as `ratio` of its memory allows; None if the
+        layers do not fit. Filling greedily in order is optimal for this test."""
+        counts: list[int] = []
+        layer = 0
+        for node, memory in enumerate(node_bytes):
+            capacity = ratio * memory
+            nodes_after = n_nodes - node - 1
+            if nodes_after == 0:
+                end = n_layers
+            else:
+                end, last = layer + 1, n_layers - nodes_after
+                load = layer_bytes[layer]
+                while end < last and load + layer_bytes[end] <= capacity:
+                    load += layer_bytes[end]
+                    end += 1
+            if sum(layer_bytes[layer:end]) > capacity:
+                return None
+            counts.append(end - layer)
+            layer = end
+        return counts
+
+    low, high = 0.0, sum(layer_bytes) / min(node_bytes) + 1.0
+    best = split_at(high)
+    assert best is not None
+    for _ in range(64):
+        middle = (low + high) / 2
+        counts = split_at(middle)
+        if counts is None:
+            low = middle
+        else:
+            high, best = middle, counts
+    return best
+
+
 def _allocate_and_validate_layers(
     node_ids: list[NodeId],
     node_memory: Mapping[NodeId, MemoryUsage],
     total_memory: Memory,
     model_card: ModelCard,
 ) -> list[int]:
-    layer_allocations = allocate_layers_proportionally(
-        total_layers=model_card.n_layers,
-        memory_fractions=[
-            node_memory[node_id].ram_available / total_memory for node_id in node_ids
-        ],
-    )
+    """Layer counts per node, in the order the nodes take the layers."""
+    if model_card.extra_layer_storage:
+        layer_allocations = allocate_layers_by_storage(
+            model_card.layer_storage_bytes(),
+            [node_memory[node_id].ram_available.in_bytes for node_id in node_ids],
+        )
+    else:
+        layer_allocations = allocate_layers_proportionally(
+            total_layers=model_card.n_layers,
+            memory_fractions=[
+                node_memory[node_id].ram_available / total_memory
+                for node_id in node_ids
+            ],
+        )
 
-    total_storage = model_card.storage_size
-    total_layers = model_card.n_layers
+    layers_before = 0
     for i, node_id in enumerate(node_ids):
         node_layers = layer_allocations[i]
-        required_memory = (total_storage * node_layers) // total_layers
+        required_memory = Memory.from_bytes(
+            model_card.shard_storage_bytes(layers_before, layers_before + node_layers)
+        )
+        layers_before += node_layers
         available_memory = node_memory[node_id].ram_available
         if required_memory > available_memory:
             raise ValueError(
@@ -209,15 +275,29 @@ def _get_shard_assignments_for_pure_pipeline(
     _validate_cycle(cycle)
     total_memory = _compute_total_memory(cycle.node_ids, node_memory)
 
-    layer_allocations = _allocate_and_validate_layers(
-        cycle.node_ids, node_memory, total_memory, model_card
+    # A reversed pipeline hands the first layers to the last rank.
+    layer_order = (
+        list(reversed(cycle.node_ids))
+        if model_card.pipeline_layers_reversed
+        else list(cycle.node_ids)
+    )
+    allocations_in_layer_order = _allocate_and_validate_layers(
+        layer_order, node_memory, total_memory, model_card
+    )
+    layer_allocations = (
+        list(reversed(allocations_in_layer_order))
+        if model_card.pipeline_layers_reversed
+        else allocations_in_layer_order
     )
 
     runner_to_shard: dict[RunnerId, ShardMetadata] = {}
     node_to_runner: dict[NodeId, RunnerId] = {}
 
     for pipeline_rank, node_id in enumerate(cycle.node_ids):
-        layers_before = sum(layer_allocations[:pipeline_rank])
+        if model_card.pipeline_layers_reversed:
+            layers_before = sum(layer_allocations[pipeline_rank + 1 :])
+        else:
+            layers_before = sum(layer_allocations[:pipeline_rank])
         node_layers = layer_allocations[pipeline_rank]
 
         shard = PipelineShardMetadata(

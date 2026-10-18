@@ -55,17 +55,19 @@ def encode_messages(
     return prompt
 
 
+# V4.1 writes its tag names with a leading space ("<｜DSML｜ invoke"), V3.2
+# and V4 without; the parser takes both.
 _INVOKE_PATTERN = re.compile(
-    rf"<{re.escape(DSML_TOKEN)}invoke\s+name=\"([^\"]+)\">"
+    rf"<{re.escape(DSML_TOKEN)} ?invoke\s+name=\"([^\"]+)\">"
     rf"(.*?)"
-    rf"</{re.escape(DSML_TOKEN)}invoke>",
+    rf"</{re.escape(DSML_TOKEN)} ?invoke>",
     re.DOTALL,
 )
 
 _PARAM_PATTERN = re.compile(
-    rf"<{re.escape(DSML_TOKEN)}parameter\s+name=\"([^\"]+)\"\s+string=\"(true|false)\">"
+    rf"<{re.escape(DSML_TOKEN)} ?parameter\s+name=\"([^\"]+)\"\s+string=\"(true|false)\">"
     rf"(.*?)"
-    rf"</{re.escape(DSML_TOKEN)}parameter>",
+    rf"</{re.escape(DSML_TOKEN)} ?parameter>",
     re.DOTALL,
 )
 

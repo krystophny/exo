@@ -1,3 +1,4 @@
+import copy
 import gc
 import hashlib
 import os
@@ -22,6 +23,7 @@ from mlx_lm.models.deepseek_v4 import (
     _CompressorBranch as CompressorBranch,  # type: ignore
 )
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
+from mlx_lm.models.deepseek_v41 import LayerCache as DeepseekV41Cache
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.types.memory import Memory
@@ -77,14 +79,23 @@ _MAX_BYTES = int(
 )
 
 
+# A per-layer snapshot: the cache types that cannot be trimmed back.
+type SnapshotEntry = (
+    RotatingKVCache
+    | ArraysCache
+    | CacheList
+    | DeepseekV4Cache
+    | DeepseekV41Cache
+    | None
+)
+
+
 class CacheSnapshot:
     """Snapshot of states at a known token position."""
 
     def __init__(
         self,
-        states: list[
-            RotatingKVCache | ArraysCache | CacheList | DeepseekV4Cache | None
-        ],
+        states: list[SnapshotEntry],
         token_count: int,
     ):
         self.states = states
@@ -195,9 +206,18 @@ def _copy_v4_cache(c: DeepseekV4Cache) -> DeepseekV4Cache:
     return snap
 
 
-def copy_snapshot_entry(
-    entry: ArraysCache | RotatingKVCache | CacheList | DeepseekV4Cache | None,
-) -> ArraysCache | RotatingKVCache | CacheList | DeepseekV4Cache | None:
+def _copy_v41_cache(c: DeepseekV41Cache) -> DeepseekV41Cache:
+    """A V4.1 layer cache only ever replaces its arrays, never writes into
+    them, so a shallow copy is a snapshot. NumPy fields (the Engram n-gram
+    history) are copied in case they are updated in place."""
+    snap = copy.copy(c)
+    for name, value in vars(snap).items():  # pyright: ignore[reportAny]
+        if isinstance(value, np.ndarray):
+            setattr(snap, name, value.copy())
+    return snap
+
+
+def copy_snapshot_entry(entry: SnapshotEntry) -> SnapshotEntry:
     match entry:
         case None:
             return None
@@ -210,12 +230,12 @@ def copy_snapshot_entry(
             return _copy_cache_list(entry)
         case DeepseekV4Cache():
             return _copy_v4_cache(entry)
+        case DeepseekV41Cache():
+            return _copy_v41_cache(entry)
 
 
 def snapshot_ssm_states(cache: KVCacheType) -> CacheSnapshot:
-    states: list[
-        RotatingKVCache | ArraysCache | CacheList | DeepseekV4Cache | None
-    ] = []
+    states: list[SnapshotEntry] = []
     for c in cache:
         if isinstance(c, ArraysCache):
             states.append(_copy_arrays_cache(c))
@@ -225,6 +245,8 @@ def snapshot_ssm_states(cache: KVCacheType) -> CacheSnapshot:
             states.append(_copy_cache_list(c))
         elif isinstance(c, DeepseekV4Cache):
             states.append(_copy_v4_cache(c))
+        elif isinstance(c, DeepseekV41Cache):
+            states.append(_copy_v41_cache(c))
         else:
             states.append(None)
     token_count = cache_length(cache)
@@ -252,7 +274,7 @@ def is_non_trimmable_cache_entry(c: object) -> bool:
         return True
     if isinstance(c, CacheList):
         return not bool(c.is_trimmable())  # type: ignore[reportUnknownMemberType]
-    return isinstance(c, DeepseekV4Cache)
+    return isinstance(c, (DeepseekV4Cache, DeepseekV41Cache))
 
 
 def has_non_kv_caches(cache: KVCacheType) -> bool:
@@ -469,7 +491,7 @@ class KVPrefixCache:
             for c in prompt_cache:
                 if isinstance(c, (ArraysCache, RotatingKVCache, CacheList)):
                     continue
-                if isinstance(c, DeepseekV4Cache):
+                if isinstance(c, (DeepseekV4Cache, DeepseekV41Cache)):
                     continue
                 if hasattr(c, "offset"):
                     c.offset = restore_pos
@@ -609,6 +631,15 @@ def trim_cache(
     snapshot: CacheSnapshot | None = None,
 ) -> None:
     for i, c in enumerate(cache):
+        if isinstance(c, DeepseekV41Cache):
+            # Evicted window rows and closed compressed groups cannot be
+            # recovered: only a snapshot rolls a V4.1 cache back.
+            if snapshot is None or snapshot.states[i] is None:
+                raise ValueError(
+                    "A DeepSeek V4.1 cache can only be trimmed to a snapshot"
+                )
+            cache[i] = _copy_v41_cache(cast(DeepseekV41Cache, snapshot.states[i]))  # type: ignore
+            continue
         non_trimmable = isinstance(c, (ArraysCache, RotatingKVCache)) or (
             isinstance(c, CacheList) and not bool(c.is_trimmable())  # type: ignore[reportUnknownMemberType]
         )
@@ -652,7 +683,8 @@ def _entry_length(
     | QuantizedKVCache
     | ArraysCache
     | CacheList
-    | DeepseekV4Cache,
+    | DeepseekV4Cache
+    | DeepseekV41Cache,
 ) -> int:
     # Use .offset attribute which KVCache types have (len() not implemented in older QuantizedKVCache).
     if hasattr(c, "offset"):

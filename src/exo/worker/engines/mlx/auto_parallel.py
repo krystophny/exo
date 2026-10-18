@@ -21,6 +21,7 @@ from mlx_lm.models.deepseek_v4 import DeepseekV4MoE, V4Attention
 from mlx_lm.models.deepseek_v4 import Model as DeepseekV4Model
 from mlx_lm.models.deepseek_v32 import DeepseekV32DecoderLayer, DeepseekV32MLP
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
+from mlx_lm.models.deepseek_v41 import Model as DeepseekV41Model
 from mlx_lm.models.gemma4 import Model as Gemma4Model
 from mlx_lm.models.glm4_moe import Model as Glm4MoeModel
 from mlx_lm.models.glm4_moe import MoE
@@ -298,6 +299,9 @@ def pipeline_auto_parallel(
     Returns:
     The parallelized model
     """
+    if isinstance(model, DeepseekV41Model):
+        return (yield from _deepseek_v41_pipeline(model, group, model_shard_meta))
+
     inner_model_instance: nn.Module = get_inner_model(model)
 
     layers = get_layers(inner_model_instance)
@@ -405,6 +409,79 @@ def pipeline_auto_parallel(
     )
 
     return patch_pipeline_model(model, group)
+
+
+def native_pipeline_split(
+    rank: int, world_size: int, start_layer: int, end_layer: int, n_layers: int
+) -> list[int]:
+    """A layer split for mlx-lm's PipelineMixin that gives `rank` exactly the
+    layers [start_layer, end_layer).
+
+    PipelineMixin hands the last rank the first layers: rank r runs the layers
+    after those of ranks r+1 .. size-1. Only this rank's entry and the sums on
+    either side of it matter to the rank itself; the other entries just need to
+    be positive.
+    """
+    ranks_before, ranks_after = world_size - 1 - rank, rank
+    layers_before, layers_after = start_layer, n_layers - end_layer
+    if end_layer <= start_layer:
+        raise ValueError(f"Rank {rank} has no layers: [{start_layer}, {end_layer})")
+    if layers_before < ranks_before or layers_after < ranks_after:
+        raise ValueError(
+            f"Rank {rank} of {world_size} holds layers [{start_layer}, {end_layer}) "
+            f"of {n_layers}, which is not a reversed pipeline split: the ranks "
+            "after it must hold the earlier layers"
+        )
+    if (layers_before == 0) != (ranks_before == 0) or (layers_after == 0) != (
+        ranks_after == 0
+    ):
+        raise ValueError(
+            f"Rank {rank} of {world_size} holds layers [{start_layer}, {end_layer}) "
+            f"of {n_layers}; a reversed pipeline gives the last rank the first "
+            "layer and rank 0 the last"
+        )
+
+    def spread(total: int, parts: int) -> list[int]:
+        base, extra = divmod(total, parts) if parts else (0, 0)
+        return [base + (1 if i < extra else 0) for i in range(parts)]
+
+    # split[0 .. rank-1] cover the last layers, split[rank+1 ..] the first ones.
+    return [
+        *spread(layers_after, ranks_after),
+        end_layer - start_layer,
+        *spread(layers_before, ranks_before),
+    ]
+
+
+def _deepseek_v41_pipeline(
+    model: DeepseekV41Model,
+    group: mx.distributed.Group,
+    model_shard_meta: PipelineShardMetadata,
+) -> Generator[ModelLoadingResponse, None, nn.Module]:
+    """DeepSeek V4.1 sends cross-layer state (shared compressed KV, index keys,
+    hyper-connection mixes) between stages, which exo's single-tensor layer
+    wrappers cannot carry, so it runs mlx-lm's own pipeline. The master places
+    its layers in that pipeline's reversed rank order."""
+    rank, world_size = model_shard_meta.device_rank, model_shard_meta.world_size
+    if group.size() != world_size or group.rank() != rank:
+        raise ValueError(
+            f"Group rank {group.rank()}/{group.size()} does not match the shard's "
+            f"rank {rank}/{world_size}"
+        )
+    split = native_pipeline_split(
+        rank,
+        world_size,
+        model_shard_meta.start_layer,
+        model_shard_meta.end_layer,
+        model_shard_meta.n_layers,
+    )
+    model.model.pipeline(group, split)
+    layers = model.model.pipeline_layers
+    for i, layer in enumerate(layers):
+        mx.eval(layer)
+        mx.clear_cache()
+        yield ModelLoadingResponse(layers_loaded=i, total=len(layers))
+    return model
 
 
 def patch_pipeline_model[T](model: T, group: mx.distributed.Group) -> T:
@@ -527,6 +604,14 @@ def tensor_auto_parallel(
         )
     elif isinstance(model, DeepseekV4Model):
         tensor_parallel_sharding_strategy = DeepseekV4ShardingStrategy(
+            group,
+            all_to_sharded_linear,
+            sharded_to_all_linear,
+            all_to_sharded_linear_in_place,
+            sharded_to_all_linear_in_place,
+        )
+    elif isinstance(model, DeepseekV41Model):
+        tensor_parallel_sharding_strategy = DeepseekV41ShardingStrategy(
             group,
             all_to_sharded_linear,
             sharded_to_all_linear,
@@ -953,6 +1038,27 @@ class DeepseekV4ShardingStrategy(TensorParallelShardingStrategy):
             mx.clear_cache()
             yield ModelLoadingResponse(layers_loaded=i, total=total)
 
+        return model
+
+
+class DeepseekV41ShardingStrategy(TensorParallelShardingStrategy):
+    """mlx-lm's own V4.1 tensor parallelism: head groups, experts and the
+    row-split n-gram tables. It needs the rank count to divide the 64 heads
+    and 8 output groups, so it runs on 1, 2, 4 or 8 ranks."""
+
+    def shard_model(
+        self,
+        model: nn.Module,
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
+        model = cast(DeepseekV41Model, model)
+        # Shard the lazy model, then load one layer at a time, as mlx-lm's
+        # sharded_load does: each rank only materialises its slices.
+        model.shard(self.group)
+        total = len(model.layers)
+        for i, layer in enumerate(model.layers):
+            mx.eval(layer)
+            mx.clear_cache()
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
         return model
 
 

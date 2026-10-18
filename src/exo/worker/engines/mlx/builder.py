@@ -4,6 +4,7 @@ from collections.abc import Generator
 from dataclasses import dataclass
 
 import mlx.core as mx
+from mlx_lm.models.deepseek_v41 import Model as DeepseekV41Model
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.types.common import ModelId
@@ -127,7 +128,9 @@ class MlxBuilder(Builder):
                 vision_processor=None,
                 num_slots=slots,
             )
-        if os.environ.get("EXO_NO_BATCH"):
+        # mlx-lm's DeepSeek V4.1 layer cache cannot merge into a batch.
+        no_batch_model = isinstance(self.inference_model, DeepseekV41Model)
+        if os.environ.get("EXO_NO_BATCH") or no_batch_model:
             logger.info("using SequentialGenerator (batching disabled)")
             return SequentialGenerator(
                 model=self.inference_model,

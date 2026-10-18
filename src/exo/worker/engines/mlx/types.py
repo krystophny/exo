@@ -12,6 +12,7 @@ from mlx_lm.models.cache import (
     RotatingKVCache,
 )
 from mlx_lm.models.deepseek_v4 import DeepseekV4Cache
+from mlx_lm.models.deepseek_v41 import LayerCache as DeepseekV41Cache
 
 # This list contains one cache entry per transformer layer
 KVCacheType = Sequence[
@@ -21,6 +22,7 @@ KVCacheType = Sequence[
     | ArraysCache
     | CacheList
     | DeepseekV4Cache
+    | DeepseekV41Cache
 ]
 
 
