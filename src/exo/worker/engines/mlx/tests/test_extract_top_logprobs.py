@@ -5,11 +5,11 @@ from unittest.mock import MagicMock
 import mlx.core as mx
 import pytest
 
+from exo.worker.engines.mlx.generator.generate import extract_top_logprobs
 from exo.worker.engines.mlx.patches.opt_batch_gen import (
     _apply_logits_processors,
     _patched_step,
 )
-from exo.worker.engines.mlx.generator.generate import extract_top_logprobs
 
 
 def _mock_tokenizer() -> MagicMock:
