@@ -48,9 +48,7 @@ def _parse_active_limit() -> int:
             f"EXO_COOPERATIVE_ACTIVE must be an integer >= 0, got {raw!r}"
         ) from exc
     if value < 0:
-        raise ValueError(
-            f"EXO_COOPERATIVE_ACTIVE must be an integer >= 0, got {raw!r}"
-        )
+        raise ValueError(f"EXO_COOPERATIVE_ACTIVE must be an integer >= 0, got {raw!r}")
     return value
 
 
@@ -171,8 +169,7 @@ class CooperativeGenerator(SequentialGenerator):
     def __post_init__(self) -> None:
         if self.num_slots < 2:
             raise ValueError(
-                "EXO_COOPERATIVE_SLOTS must be an integer >= 2, got "
-                f"{self.num_slots}"
+                f"EXO_COOPERATIVE_SLOTS must be an integer >= 2, got {self.num_slots}"
             )
         self._active_limit = _parse_active_limit()
         self._min_match = _parse_min_match()
@@ -549,9 +546,7 @@ class CooperativeGenerator(SequentialGenerator):
         while self._queue:
             if self._active_limit > 0:
                 busy = sum(
-                    1
-                    for slot in self._slots
-                    if slot._active is not None or slot._queue
+                    1 for slot in self._slots if slot._active is not None or slot._queue
                 )
                 if busy >= self._active_limit:
                     break
@@ -591,7 +586,8 @@ class CooperativeGenerator(SequentialGenerator):
                 # detected the same way a divergent cache digest is.
                 metadata = [
                     candidate.kv_prefix_cache.affinity_metadata_digest()
-                    if candidate in idle_eligible and candidate.kv_prefix_cache is not None
+                    if candidate in idle_eligible
+                    and candidate.kv_prefix_cache is not None
                     else 0
                     for candidate in self._slots
                 ]
@@ -604,7 +600,9 @@ class CooperativeGenerator(SequentialGenerator):
                 # ranks pick different owners for the same task) is caught
                 # the same way a divergent cache digest is.
                 key_hashes = [
-                    _key_hash(self._slot_last_key[index]) if candidate in idle_eligible else 0
+                    _key_hash(self._slot_last_key[index])
+                    if candidate in idle_eligible
+                    else 0
                     for index, candidate in enumerate(self._slots)
                 ]
                 gathered = mx.distributed.all_gather(

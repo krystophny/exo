@@ -645,7 +645,6 @@ def test_owner_turn_survives_interleaved_computor_request(
     assert any(
         chunk.usage is not None
         and chunk.usage.prompt_tokens_details is not None
-        and chunk.usage.prompt_tokens_details.cached_tokens
-        >= len(owner1_tokens) - 2
+        and chunk.usage.prompt_tokens_details.cached_tokens >= len(owner1_tokens) - 2
         for chunk in owner2_chunks
     )

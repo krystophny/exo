@@ -32,9 +32,7 @@ from exo.worker.tests.unittests.test_runner.test_event_ordering import (
 )
 
 
-def engine(
-    monkeypatch: pytest.MonkeyPatch, num_slots: int = 2
-) -> CooperativeGenerator:
+def engine(monkeypatch: pytest.MonkeyPatch, num_slots: int = 2) -> CooperativeGenerator:
     monkeypatch.setenv("EXO_COOPERATIVE_CACHE_BUDGET_BYTES", str(16 * 1024**3))
     monkeypatch.setenv("EXO_COOPERATIVE_PHYSICAL_MARGIN_BYTES", str(8 * 1024**3))
     monkeypatch.setenv("EXO_KV_BITS", "8")
@@ -105,9 +103,7 @@ def test_warm_prefix_buffers_are_credited_and_cross_owner_alias_rejected(
     allocated, nonoverlap = result._owner_buffers()
     assert nonoverlap and allocated[0] > 0
     # A small request reuses the warm storage without adding another full budget.
-    assert result._admit_memory(
-        0, 65536, list(result._slots), list(result._slots)
-    )
+    assert result._admit_memory(0, 65536, list(result._slots), list(result._slots))
     assert prefix.caches[0] is cache
     other = cast(_OwnerPrefixCache, result._slots[1].kv_prefix_cache)
     other.caches.append(cache)
@@ -170,9 +166,7 @@ def test_failed_kernel_probe_is_unsafe_and_still_enters_fixed_collective(
         return mx.concatenate([row, row])
 
     monkeypatch.setattr(mx.distributed, "all_gather", gather)
-    assert not result._admit_memory(
-        0, 65536, list(result._slots), list(result._slots)
-    )
+    assert not result._admit_memory(0, 65536, list(result._slots), list(result._slots))
     assert 1 <= len(calls) <= 4 and all(row[0] == 0 for row in calls)
     assert all(row[1:4] == calls[0][1:4] for row in calls)
 
@@ -224,9 +218,7 @@ def test_other_idle_eviction_preserves_chosen_warm_cache(
         return [[ready, mask, chosen, requested, 0, 0, 0, 0, 0]]
 
     monkeypatch.setattr(result, "_memory_rows", rows)
-    assert result._admit_memory(
-        0, 65536, list(result._slots), list(result._slots)
-    )
+    assert result._admit_memory(0, 65536, list(result._slots), list(result._slots))
     assert selected.caches[0] is warm
     assert other.caches == []
     # One initial mismatch check, one no-op retry (transient-mismatch
@@ -547,6 +539,7 @@ def test_cancelling_active_frees_slot_for_next_queued_task(
         return task_id == running.task_id
 
     monkeypatch.setattr(result, "should_cancel", cancel_running)
+
     def rendered(*args: object) -> str:
         return "r"
 

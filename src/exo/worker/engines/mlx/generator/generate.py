@@ -337,7 +337,9 @@ def prefill(
 
     is_pipeline = _has_pipeline_communication_layer(model)
 
-    prefill_step_size = prefill_step_size_override or int(os.getenv("EXO_PREFILL_STEP_SIZE", "4096"))
+    prefill_step_size = prefill_step_size_override or int(
+        os.getenv("EXO_PREFILL_STEP_SIZE", "4096")
+    )
 
     try:
         if is_pipeline and num_tokens >= prefill_step_size:
@@ -774,7 +776,9 @@ def mlx_generate(
         sampler=sampler,
         logits_processors=logits_processors,
         prompt_cache=caches,
-        prefill_step_size=(prefill_step_size_override or int(os.getenv("EXO_PREFILL_STEP_SIZE", "256")))
+        prefill_step_size=(
+            prefill_step_size_override or int(os.getenv("EXO_PREFILL_STEP_SIZE", "256"))
+        )
         if use_mtp
         else 1,
         kv_group_size=KV_GROUP_SIZE,
