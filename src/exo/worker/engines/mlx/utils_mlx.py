@@ -756,9 +756,7 @@ def cooperative_slots() -> int | None:
             f"EXO_COOPERATIVE_SLOTS must be an integer >= 2, got {raw!r}"
         ) from exc
     if slots < 2:
-        raise ValueError(
-            f"EXO_COOPERATIVE_SLOTS must be an integer >= 2, got {raw!r}"
-        )
+        raise ValueError(f"EXO_COOPERATIVE_SLOTS must be an integer >= 2, got {raw!r}")
     return slots
 
 
